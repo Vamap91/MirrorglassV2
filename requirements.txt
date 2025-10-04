@@ -1,8 +1,21 @@
-streamlit
-opencv-python-headless
-numpy
-pytesseract
-pillow
-pandas
-matplotlib
-scikit-image
+# MirrorGlass V2 - Requirements
+# Sistema Integrado de Detecção de Fraudes por IA
+
+# Core
+streamlit==1.28.0
+numpy==1.24.3
+pillow==10.1.0
+
+# Visão Computacional
+opencv-python==4.8.1.78
+scikit-image==0.22.0
+
+# OCR (para detecção de texto)
+pytesseract==0.3.10
+
+# Análise de Dados
+pandas==2.1.3
+scipy==1.11.4
+
+# Visualização (opcional)
+matplotlib==3.8.2
