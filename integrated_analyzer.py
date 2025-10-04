@@ -349,17 +349,12 @@ class EdgeAnalyzer:
     def _detect_inpainting_artifacts(self, image: np.ndarray) -> float:
         """
         Detecta artefatos específicos de inpainting por IA
-        
-        Características:
-        - Transições em forma de "halo" ao redor da área editada
-        - Mudança brusca de textura mas gradiente suave de cor
-        - Padrões repetitivos ao redor da borda
+        VERSÃO ULTRA AGRESSIVA
         """
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         h, w = gray.shape
         
-        # 1. Detectar mudanças de TEXTURA (não cor)
-        # Calcular desvio padrão local (textura)
+        # Múltiplas análises combinadas
         kernel_size = 15
         gray_float = gray.astype(np.float32)
         
@@ -369,48 +364,44 @@ class EdgeAnalyzer:
         variance = np.maximum(variance, 0)
         texture_map = np.sqrt(variance)
         
-        # 2. Detectar mudanças ABRUPTAS de textura
+        # Gradientes de textura e cor
         texture_grad_x = cv2.Sobel(texture_map, cv2.CV_64F, 1, 0, ksize=5)
         texture_grad_y = cv2.Sobel(texture_map, cv2.CV_64F, 0, 1, ksize=5)
         texture_change = np.sqrt(texture_grad_x**2 + texture_grad_y**2)
         
-        # 3. Detectar gradiente SUAVE de cor (característico de blend de IA)
         color_grad_x = cv2.Sobel(gray_float, cv2.CV_64F, 1, 0, ksize=5)
         color_grad_y = cv2.Sobel(gray_float, cv2.CV_64F, 0, 1, ksize=5)
         color_change = np.sqrt(color_grad_x**2 + color_grad_y**2)
         
-        # CRÍTICO: Inpainting tem ALTA mudança de textura + BAIXA mudança de cor
         texture_norm = cv2.normalize(texture_change, None, 0, 1, cv2.NORM_MINMAX)
         color_norm = cv2.normalize(color_change, None, 0, 1, cv2.NORM_MINMAX)
         
-        # Áreas suspeitas: textura muda muito, cor muda pouco
+        # Indicador de inpainting
         inpainting_indicator = texture_norm * (1 - color_norm)
         
-        # Calcular score
-        threshold = 0.3
+        # THRESHOLDS MUITO MAIS AGRESSIVOS
+        threshold = 0.2  # Diminuído de 0.3
         suspicious_ratio = np.sum(inpainting_indicator > threshold) / (h * w)
         
-        # Se > 5% da imagem tem esse padrão = MUITO suspeito
-        if suspicious_ratio > 0.15:
-            return 0.9
-        elif suspicious_ratio > 0.08:
-            return 0.7
-        elif suspicious_ratio > 0.03:
-            return 0.4
+        # Escala MUITO mais sensível
+        if suspicious_ratio > 0.08:  # Diminuído de 0.15
+            return 0.95
+        elif suspicious_ratio > 0.04:  # Diminuído de 0.08
+            return 0.85
+        elif suspicious_ratio > 0.02:  # Diminuído de 0.03
+            return 0.65
+        elif suspicious_ratio > 0.01:
+            return 0.45
         else:
-            return suspicious_ratio * 5  # Escalar linearmente
+            return suspicious_ratio * 20  # Aumentado de 5
     
     def _detect_blend_artifacts(self, image: np.ndarray) -> float:
         """
-        Detecta artefatos de blending (mistura) de IA
-        
-        IA usa blending gaussiano perfeito que é detectável
+        Detecta artefatos de blending MAIS AGRESSIVO
         """
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         h, w = gray.shape
         
-        # Aplicar Laplaciano em múltiplas escalas
-        # IA deixa "resíduo" característico
         laplacians = []
         
         for sigma in [1, 2, 4]:
@@ -418,30 +409,26 @@ class EdgeAnalyzer:
             laplacian = cv2.Laplacian(blurred, cv2.CV_64F, ksize=5)
             laplacians.append(np.abs(laplacian))
         
-        # Comparar laplacianos em diferentes escalas
-        # Blending de IA tem razão específica entre escalas
         ratio_12 = laplacians[0] / (laplacians[1] + 1e-7)
         ratio_23 = laplacians[1] / (laplacians[2] + 1e-7)
         
-        # Normalizar
         ratio_12_norm = cv2.normalize(ratio_12, None, 0, 1, cv2.NORM_MINMAX)
         ratio_23_norm = cv2.normalize(ratio_23, None, 0, 1, cv2.NORM_MINMAX)
         
-        # Áreas com razões muito uniformes = blending artificial
         variance_r12 = np.var(ratio_12_norm)
         variance_r23 = np.var(ratio_23_norm)
         
-        # Blending de IA tem BAIXA variância
+        # MUITO mais sensível
         blend_score = 0
         
-        if variance_r12 < 0.01 and variance_r23 < 0.01:
-            blend_score = 0.8
-        elif variance_r12 < 0.03 or variance_r23 < 0.03:
-            blend_score = 0.5
-        elif variance_r12 < 0.05 or variance_r23 < 0.05:
-            blend_score = 0.3
+        if variance_r12 < 0.02 and variance_r23 < 0.02:  # Diminuído de 0.01
+            blend_score = 0.9  # Aumentado de 0.8
+        elif variance_r12 < 0.05 or variance_r23 < 0.05:  # Diminuído de 0.03
+            blend_score = 0.7  # Aumentado de 0.5
+        elif variance_r12 < 0.08 or variance_r23 < 0.08:  # Diminuído de 0.05
+            blend_score = 0.5  # Aumentado de 0.3
         else:
-            blend_score = max(0, 0.3 - variance_r12 - variance_r23)
+            blend_score = max(0, 0.5 - variance_r12 - variance_r23)
         
         return float(blend_score)
     
@@ -801,18 +788,22 @@ class IntegratedTextureAnalyzer:
                 edge_result = self.edge_analyzer.analyze_edges(image)
                 edge_artifact = edge_result['edge_artifact_score']
                 
-                # SISTEMA DE PENALIDADE AGRESSIVO
-                # Score alto de artefato = penalidade ENORME
-                if edge_artifact > 0.7:
-                    edge_score_penalty = 50  # PENALIDADE MÁXIMA
-                elif edge_artifact > 0.5:
-                    edge_score_penalty = 40
-                elif edge_artifact > 0.3:
-                    edge_score_penalty = 30
+                # SISTEMA DE PENALIDADE EXTREMAMENTE AGRESSIVO
+                # Qualquer sinal de artefato = penalidade grande
+                if edge_artifact > 0.8:
+                    edge_score_penalty = 60  # PENALIDADE MASSIVA
+                elif edge_artifact > 0.6:
+                    edge_score_penalty = 55
+                elif edge_artifact > 0.4:
+                    edge_score_penalty = 50
+                elif edge_artifact > 0.25:
+                    edge_score_penalty = 45
                 elif edge_artifact > 0.15:
-                    edge_score_penalty = 20
+                    edge_score_penalty = 35
+                elif edge_artifact > 0.08:
+                    edge_score_penalty = 25
                 else:
-                    edge_score_penalty = int(edge_artifact * 100)
+                    edge_score_penalty = int(edge_artifact * 150)  # Multiplicador alto
                 
                 if self.debug:
                     print(f"FASE 3: Edge artifact: {edge_artifact:.2%} → penalty: -{edge_score_penalty}")
@@ -854,6 +845,10 @@ class IntegratedTextureAnalyzer:
         return integrated_results
     
     def _analyze_texture_with_mask(self, image, exclusion_mask):
+        """
+        Análise de textura CORRIGIDA
+        Foco: detectar IA, ignorar uniformidade natural
+        """
         if len(image.shape) > 2:
             img_gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
         else:
@@ -870,11 +865,13 @@ class IntegratedTextureAnalyzer:
         variance_map = np.zeros((rows, cols))
         entropy_map = np.zeros((rows, cols))
         exclusion_map = np.zeros((rows, cols))
+        uniformity_map = np.zeros((rows, cols))  # NOVO
         
         for i in range(0, height - self.block_size + 1, self.block_size):
             for j in range(0, width - self.block_size + 1, self.block_size):
                 block_lbp = lbp_image[i:i+self.block_size, j:j+self.block_size]
                 block_mask = exclusion_mask_resized[i:i+self.block_size, j:j+self.block_size]
+                block_gray = img_gray[i:i+self.block_size, j:j+self.block_size]
                 
                 row_idx = i // self.block_size
                 col_idx = j // self.block_size
@@ -885,7 +882,9 @@ class IntegratedTextureAnalyzer:
                     exclusion_map[row_idx, col_idx] = 1
                     variance_map[row_idx, col_idx] = 1.0
                     entropy_map[row_idx, col_idx] = 1.0
+                    uniformity_map[row_idx, col_idx] = 0
                 else:
+                    # Calcular entropia LBP
                     hist, _ = np.histogram(block_lbp, bins=10, range=(0, 10))
                     hist = hist.astype("float")
                     hist /= (hist.sum() + 1e-7)
@@ -893,16 +892,38 @@ class IntegratedTextureAnalyzer:
                     max_entropy = np.log(10)
                     norm_entropy = block_entropy / max_entropy if max_entropy > 0 else 0
                     
+                    # Calcular variância LBP
                     block_variance = np.var(block_lbp) / 255.0
+                    
+                    # NOVO: Detectar uniformidade NATURAL (etiquetas, papéis)
+                    # vs uniformidade ARTIFICIAL (IA)
+                    gray_std = np.std(block_gray)
+                    gray_mean = np.mean(block_gray)
+                    
+                    # Etiquetas: STD muito baixo + brightness alto
+                    is_natural_uniform = (gray_std < 10 and gray_mean > 150)
                     
                     if row_idx < rows and col_idx < cols:
                         variance_map[row_idx, col_idx] = block_variance
                         entropy_map[row_idx, col_idx] = norm_entropy
+                        uniformity_map[row_idx, col_idx] = 1.0 if is_natural_uniform else 0.0
         
-        naturalness_map = entropy_map * 0.7 + variance_map * 0.3
+        # Calcular naturalness COM correção de uniformidade
+        # Áreas naturalmente uniformes (etiquetas) recebem score ALTO
+        naturalness_map = np.where(
+            uniformity_map > 0.5,
+            1.0,  # Uniformidade natural = score máximo
+            entropy_map * 0.7 + variance_map * 0.3  # Score normal
+        )
+        
         norm_naturalness_map = cv2.normalize(naturalness_map, None, 0, 1, cv2.NORM_MINMAX)
         
-        suspicious_mask = (norm_naturalness_map < self.threshold) & (exclusion_map == 0)
+        # Áreas suspeitas: baixa naturalidade E NÃO é uniformidade natural
+        suspicious_mask = (
+            (norm_naturalness_map < self.threshold) & 
+            (exclusion_map == 0) &
+            (uniformity_map < 0.5)  # NOVO: ignorar uniformidade natural
+        )
         
         valid_blocks = exclusion_map == 0
         if np.sum(valid_blocks) > 0:
