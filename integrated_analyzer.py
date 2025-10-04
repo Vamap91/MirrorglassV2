@@ -895,39 +895,42 @@ class IntegratedTextureAnalyzer:
                     # Calcular variância LBP
                     block_variance = np.var(block_lbp) / 255.0
                     
-                    # NOVO: Detectar uniformidade NATURAL (etiquetas, papéis)
-                    # vs uniformidade ARTIFICIAL (IA)
+                    # CORRIGIDO: Detectar apenas papel/etiqueta MUITO uniforme
                     gray_std = np.std(block_gray)
                     gray_mean = np.mean(block_gray)
                     
-                    # Etiquetas: STD muito baixo + brightness alto
-                    is_natural_uniform = (gray_std < 10 and gray_mean > 150)
+                    # Só marcar como natural se for EXTREMAMENTE uniforme (etiqueta)
+                    # E não área normal de carro
+                    is_natural_uniform = (gray_std < 5 and gray_mean > 180)
                     
                     if row_idx < rows and col_idx < cols:
                         variance_map[row_idx, col_idx] = block_variance
                         entropy_map[row_idx, col_idx] = norm_entropy
                         uniformity_map[row_idx, col_idx] = 1.0 if is_natural_uniform else 0.0
         
-        # Calcular naturalness COM correção de uniformidade
-        # Áreas naturalmente uniformes (etiquetas) recebem score ALTO
-        naturalness_map = np.where(
-            uniformity_map > 0.5,
-            1.0,  # Uniformidade natural = score máximo
-            entropy_map * 0.7 + variance_map * 0.3  # Score normal
-        )
-        
+        # Calcular naturalness normalmente (SEM forçar 1.0 para uniformes)
+        naturalness_map = entropy_map * 0.7 + variance_map * 0.3
         norm_naturalness_map = cv2.normalize(naturalness_map, None, 0, 1, cv2.NORM_MINMAX)
         
-        # Áreas suspeitas: baixa naturalidade E NÃO é uniformidade natural
+        # Áreas suspeitas: baixa naturalidade E NÃO é área legítima
         suspicious_mask = (
             (norm_naturalness_map < self.threshold) & 
             (exclusion_map == 0) &
-            (uniformity_map < 0.5)  # NOVO: ignorar uniformidade natural
+            (uniformity_map < 0.5)
         )
         
         valid_blocks = exclusion_map == 0
         if np.sum(valid_blocks) > 0:
+            # CORRIGIDO: Não penalizar áreas naturalmente uniformes
+            # Mas também não dar score artificial de 100%
             naturalness_score = int(np.mean(norm_naturalness_map[valid_blocks]) * 100)
+            
+            # Ajustar score se houver muita uniformidade natural
+            natural_uniform_ratio = np.sum(uniformity_map > 0.5) / np.sum(valid_blocks)
+            if natural_uniform_ratio > 0.3:
+                # Tem muito papel/etiqueta, aumentar score um pouco
+                naturalness_score = min(100, int(naturalness_score * 1.2))
+            
             suspicious_percentage = float(np.sum(suspicious_mask) / np.sum(valid_blocks) * 100)
         else:
             naturalness_score = 100
@@ -947,7 +950,14 @@ class IntegratedTextureAnalyzer:
         }
     
     def _classify_naturalness(self, score):
-        if score <= 45:
+        """
+        Classificação ajustada para evitar falsos positivos extremos
+        """
+        if score == 0:
+            return "Erro de análise", "Score zero - Revisar imagem manualmente"
+        elif score <= 15:
+            return "Análise inconclusiva", "Score muito baixo - Possível detecção excessiva ou imagem muito manipulada"
+        elif score <= 45:
             return "Alta chance de manipulação", "Textura artificial detectada"
         elif score <= 70:
             return "Textura suspeita", "Revisão manual sugerida"
