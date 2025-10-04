@@ -1,1 +1,12 @@
-streamlit
+opencv-python==4.8.1.78
+numpy==1.24.3
+pytesseract==0.3.10
+streamlit==1.28.0
+pillow==10.1.0
+pandas==2.1.3
+matplotlib==3.8.2
+scikit-image==0.22.0
+
+# Opcional para testes
+pytest==7.4.3
+pytest-cov==4.1.0
