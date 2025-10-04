@@ -296,6 +296,250 @@ class LegitimateElementDetector:
         return exclusion_mask
 
 
+class EdgeAnalyzer:
+    """
+    NOVO - V2.2: Analisa bordas e contornos suspeitos
+    Detecta transições artificiais características de IA
+    """
+    
+    def __init__(self, debug=False):
+        self.debug = debug
+    
+    def analyze_edges(self, image: np.ndarray) -> Dict:
+        """
+        Analisa bordas para detectar manipulações por IA
+        
+        IAs como Gemini/Midjourney criam:
+        - Bordas suaves demais (sem ruído natural)
+        - Gradientes perfeitos
+        - Transições artificiais
+        """
+        if image is None or image.size == 0:
+            raise ValueError("Imagem inválida")
+        
+        h, w = image.shape[:2]
+        
+        if self.debug:
+            print("\n--- Análise de Bordas ---")
+        
+        # 1. Detectar bordas com múltiplos métodos
+        canny_edges = self._detect_canny_edges(image)
+        smooth_edges = self._detect_smooth_edges(image)
+        
+        # 2. Analisar qualidade das bordas
+        edge_smoothness_score = self._calculate_edge_smoothness(image, canny_edges)
+        
+        # 3. Detectar transições suspeitas
+        suspicious_transitions = self._detect_suspicious_transitions(image)
+        
+        # 4. Análise de gradientes (bordas perfeitas demais)
+        gradient_anomaly_score = self._detect_perfect_gradients(image)
+        
+        # 5. Detectar áreas com bordas artificiais
+        artificial_edge_mask = self._create_artificial_edge_mask(
+            smooth_edges, suspicious_transitions
+        )
+        
+        # Score final de artificialidade de bordas (0-1)
+        # Quanto maior, mais artificial
+        edge_artifact_score = (
+            edge_smoothness_score * 0.4 +
+            gradient_anomaly_score * 0.4 +
+            (np.sum(artificial_edge_mask > 0) / (h * w)) * 0.2
+        )
+        
+        if self.debug:
+            print(f"Edge Smoothness: {edge_smoothness_score:.2%}")
+            print(f"Gradient Anomaly: {gradient_anomaly_score:.2%}")
+            print(f"Edge Artifact Score: {edge_artifact_score:.2%}")
+        
+        return {
+            'edge_artifact_score': float(edge_artifact_score),
+            'edge_smoothness_score': float(edge_smoothness_score),
+            'gradient_anomaly_score': float(gradient_anomaly_score),
+            'artificial_edge_mask': artificial_edge_mask,
+            'canny_edges': canny_edges,
+            'smooth_edges': smooth_edges
+        }
+    
+    def _detect_canny_edges(self, image: np.ndarray) -> np.ndarray:
+        """Detecta bordas usando Canny"""
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        
+        # Suavizar levemente para reduzir ruído
+        blurred = cv2.GaussianBlur(gray, (3, 3), 0)
+        
+        # Canny com thresholds ajustados
+        edges = cv2.Canny(blurred, 50, 150)
+        
+        return edges
+    
+    def _detect_smooth_edges(self, image: np.ndarray) -> np.ndarray:
+        """Detecta bordas muito suaves (característica de IA)"""
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        
+        # Suavizar mais agressivamente
+        blurred = cv2.GaussianBlur(gray, (9, 9), 0)
+        
+        # Detectar bordas no blur
+        smooth_edges = cv2.Canny(blurred, 30, 100)
+        
+        return smooth_edges
+    
+    def _calculate_edge_smoothness(self, image: np.ndarray, edges: np.ndarray) -> float:
+        """
+        Calcula quão suaves são as bordas
+        
+        Bordas naturais têm ruído/irregularidade
+        Bordas de IA são suaves demais
+        """
+        if np.sum(edges) == 0:
+            return 0.0
+        
+        # Encontrar contornos
+        contours, _ = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE)
+        
+        if not contours:
+            return 0.0
+        
+        smoothness_scores = []
+        
+        for contour in contours:
+            if len(contour) < 20:  # Ignorar contornos muito pequenos
+                continue
+            
+            # Calcular curvatura (segunda derivada)
+            # Contornos suaves têm curvatura baixa e constante
+            epsilon = 0.01 * cv2.arcLength(contour, True)
+            approx = cv2.approxPolyDP(contour, epsilon, True)
+            
+            # Razão entre contorno aproximado e original
+            # Quanto menor, mais suave
+            smoothness = len(approx) / len(contour)
+            smoothness_scores.append(smoothness)
+        
+        if smoothness_scores:
+            # Média de suavidade (valores baixos = muito suave = suspeito)
+            avg_smoothness = np.mean(smoothness_scores)
+            
+            # Inverter: quanto menor smoothness, maior o score de suspeita
+            # Se smoothness < 0.1 = bordas MUITO suaves = score alto
+            if avg_smoothness < 0.15:
+                return 0.8
+            elif avg_smoothness < 0.25:
+                return 0.5
+            else:
+                return 0.2
+        
+        return 0.0
+    
+    def _detect_suspicious_transitions(self, image: np.ndarray) -> np.ndarray:
+        """
+        Detecta transições de cor/brilho suspeitas
+        
+        IA cria transições lineares perfeitas
+        Fotos reais têm transições irregulares
+        """
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        h, w = gray.shape
+        
+        suspicious_mask = np.zeros((h, w), dtype=np.uint8)
+        
+        # Calcular gradiente direcional
+        grad_x = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=5)
+        grad_y = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=5)
+        
+        magnitude = np.sqrt(grad_x**2 + grad_y**2)
+        
+        # Normalizar
+        magnitude_norm = cv2.normalize(magnitude, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+        
+        # Detectar regiões com gradiente uniforme demais
+        # Dividir em blocos e calcular variância do gradiente
+        block_size = 32
+        
+        for i in range(0, h - block_size, block_size // 2):
+            for j in range(0, w - block_size, block_size // 2):
+                block_grad = magnitude_norm[i:i+block_size, j:j+block_size]
+                
+                if block_grad.size == 0:
+                    continue
+                
+                # Calcular variância do gradiente
+                grad_var = np.var(block_grad)
+                
+                # Se gradiente muito uniforme = suspeito
+                if grad_var < 50:
+                    mean_grad = np.mean(block_grad)
+                    
+                    # Se tem gradiente mas é uniforme = transição artificial
+                    if mean_grad > 20:
+                        suspicious_mask[i:i+block_size, j:j+block_size] = 255
+        
+        return suspicious_mask
+    
+    def _detect_perfect_gradients(self, image: np.ndarray) -> float:
+        """
+        Detecta gradientes 'perfeitos demais'
+        
+        IA cria gradientes matematicamente perfeitos
+        Fotos reais têm imperfeições
+        """
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        h, w = gray.shape
+        
+        # Calcular Laplaciano (segunda derivada)
+        # Gradientes lineares têm Laplaciano próximo de zero
+        laplacian = cv2.Laplacian(gray, cv2.CV_64F, ksize=5)
+        laplacian_abs = np.abs(laplacian)
+        
+        # Dividir imagem em regiões
+        block_size = 64
+        perfect_gradient_ratio = 0
+        total_blocks = 0
+        
+        for i in range(0, h - block_size, block_size):
+            for j in range(0, w - block_size, block_size):
+                block_lap = laplacian_abs[i:i+block_size, j:j+block_size]
+                
+                if block_lap.size == 0:
+                    continue
+                
+                total_blocks += 1
+                
+                # Calcular quantos pixels têm Laplaciano muito baixo
+                # (indicando gradiente linear perfeito)
+                low_laplacian_ratio = np.sum(block_lap < 5) / block_lap.size
+                
+                # Se mais de 60% dos pixels têm gradiente linear = suspeito
+                if low_laplacian_ratio > 0.6:
+                    # Mas deve ter alguma variação (não ser uniforme)
+                    block_gray = gray[i:i+block_size, j:j+block_size]
+                    if np.std(block_gray) > 10:
+                        perfect_gradient_ratio += 1
+        
+        if total_blocks > 0:
+            return perfect_gradient_ratio / total_blocks
+        
+        return 0.0
+    
+    def _create_artificial_edge_mask(
+        self, 
+        smooth_edges: np.ndarray,
+        suspicious_transitions: np.ndarray
+    ) -> np.ndarray:
+        """Combina detecções para criar máscara de bordas artificiais"""
+        
+        # Combinar bordas suaves com transições suspeitas
+        artificial_mask = cv2.bitwise_or(smooth_edges, suspicious_transitions)
+        
+        # Dilatar um pouco para marcar região ao redor
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        artificial_mask = cv2.dilate(artificial_mask, kernel, iterations=1)
+        
+        return artificial_mask
+
+
 class LightingAnalyzer:
     """
     NOVO - V2.1: Analisa inconsistências de iluminação
@@ -613,25 +857,28 @@ class IntegratedTextureAnalyzer:
     """
     
     def __init__(self, P=8, R=1, block_size=20, threshold=0.50, 
-                 enable_lighting_analysis=True, debug=False):
+                 enable_lighting_analysis=True, enable_edge_analysis=True, debug=False):
         self.P = P
         self.R = R
         self.block_size = block_size
         self.threshold = threshold
         self.enable_lighting_analysis = enable_lighting_analysis
+        self.enable_edge_analysis = enable_edge_analysis
         self.debug = debug
         self.legitimate_detector = LegitimateElementDetector(debug=debug)
         self.lighting_analyzer = LightingAnalyzer(debug=debug) if enable_lighting_analysis else None
+        self.edge_analyzer = EdgeAnalyzer(debug=debug) if enable_edge_analysis else None
     
     def analyze_image_integrated(self, image):
         """
-        Análise integrada completa V2.1:
+        Análise integrada completa V2.2:
         1. V2 - Elementos legítimos (texto/papel/reflexo)
-        2. NOVO - Análise de iluminação
-        3. V1 - Textura LBP
+        2. V2.1 - Análise de iluminação
+        3. V2.2 - NOVO: Análise de bordas/contornos
+        4. V1 - Textura LBP
         """
         if self.debug:
-            print("\n=== ANÁLISE INTEGRADA V2.1 ===")
+            print("\n=== ANÁLISE INTEGRADA V2.2 ===")
         
         # FASE 1: Detectar elementos legítimos (V2)
         if self.debug:
@@ -649,7 +896,7 @@ class IntegratedTextureAnalyzer:
             print(f"  Elementos: {list(legitimate_elements.keys())}")
             print(f"  Excluído: {exclusion_percentage:.1f}%")
         
-        # FASE 2: NOVA - Análise de iluminação
+        # FASE 2: Análise de iluminação (V2.1)
         lighting_result = None
         lighting_score_penalty = 0
         
@@ -659,10 +906,7 @@ class IntegratedTextureAnalyzer:
             
             try:
                 lighting_result = self.lighting_analyzer.analyze_lighting(image)
-                
-                # Penalizar score se houver inconsistências de iluminação
-                # Score de inconsistência alto = penalidade maior
-                lighting_score_penalty = int(lighting_result.inconsistency_score * 30)  # Até -30 pontos
+                lighting_score_penalty = int(lighting_result.inconsistency_score * 25)  # Até -25 pontos
                 
                 if self.debug:
                     print(f"  Inconsistência: {lighting_result.inconsistency_score:.2%}")
@@ -671,15 +915,46 @@ class IntegratedTextureAnalyzer:
                 if self.debug:
                     print(f"  Erro na análise de iluminação: {e}")
         
-        # FASE 3: Análise de textura LBP (V1)
+        # FASE 3: NOVA - Análise de bordas (V2.2)
+        edge_result = None
+        edge_score_penalty = 0
+        
+        if self.enable_edge_analysis and self.edge_analyzer:
+            if self.debug:
+                print("FASE 3: Análise de bordas/contornos...")
+            
+            try:
+                edge_result = self.edge_analyzer.analyze_edges(image)
+                
+                # Penalizar MUITO se bordas artificiais
+                # Score de artefato de borda alto = penalidade grande
+                edge_artifact = edge_result['edge_artifact_score']
+                
+                if edge_artifact > 0.6:
+                    edge_score_penalty = 35  # Penalidade ALTA
+                elif edge_artifact > 0.4:
+                    edge_score_penalty = 25
+                elif edge_artifact > 0.2:
+                    edge_score_penalty = 15
+                else:
+                    edge_score_penalty = 5
+                
+                if self.debug:
+                    print(f"  Artefatos de borda: {edge_artifact:.2%}")
+                    print(f"  Penalidade: -{edge_score_penalty} pontos")
+            except Exception as e:
+                if self.debug:
+                    print(f"  Erro na análise de bordas: {e}")
+        
+        # FASE 4: Análise de textura LBP (V1)
         if self.debug:
-            print("FASE 3: Textura LBP (V1)...")
+            print("FASE 4: Textura LBP (V1)...")
         
         texture_results = self._analyze_texture_with_mask(image, exclusion_mask)
         
-        # Combinar score: textura base - penalidade de iluminação
+        # Combinar score: textura base - penalidades
         base_score = texture_results['naturalness_score']
-        final_score = max(0, base_score - lighting_score_penalty)
+        final_score = max(0, base_score - lighting_score_penalty - edge_score_penalty)
         
         # Resultados integrados
         integrated_results = {
@@ -688,6 +963,8 @@ class IntegratedTextureAnalyzer:
             'v2_exclusion_percentage': exclusion_percentage,
             'v2_1_lighting_analysis': lighting_result.to_dict() if lighting_result else None,
             'v2_1_lighting_score_penalty': lighting_score_penalty,
+            'v2_2_edge_analysis': edge_result,
+            'v2_2_edge_score_penalty': edge_score_penalty,
             'v1_texture_analysis': texture_results,
             'base_texture_score': base_score,
             'final_score': final_score,
@@ -696,8 +973,9 @@ class IntegratedTextureAnalyzer:
         }
         
         if self.debug:
-            print(f"  Score base (textura): {base_score}")
+            print(f"\n  Score base (textura): {base_score}")
             print(f"  Penalidade (luz): -{lighting_score_penalty}")
+            print(f"  Penalidade (bordas): -{edge_score_penalty}")
             print(f"  Score final: {final_score}")
             print(f"  Categoria: {integrated_results['final_category'][0]}")
             print("=== ANÁLISE CONCLUÍDA ===\n")
@@ -787,7 +1065,7 @@ class IntegratedTextureAnalyzer:
             return "Textura natural", "Baixa chance de manipulação"
     
     def generate_visual_report(self, image, integrated_results):
-        """Gera relatório visual integrado V2.1"""
+        """Gera relatório visual integrado V2.2"""
         if len(image.shape) == 2:
             image = cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
         elif image.shape[2] == 4:
@@ -809,7 +1087,7 @@ class IntegratedTextureAnalyzer:
         
         highlighted = overlay.copy()
         
-        # Áreas suspeitas (roxo)
+        # Áreas suspeitas de textura (roxo)
         contours, _ = cv2.findContours(suspicious_mask_resized, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         for contour in contours:
             area = cv2.contourArea(contour)
@@ -824,6 +1102,57 @@ class IntegratedTextureAnalyzer:
             if area > 100:
                 x, y, w, h = cv2.boundingRect(contour)
                 cv2.rectangle(highlighted, (x, y), (x+w, y+h), (0, 255, 0), 2)
+        
+        # Inconsistências de iluminação (laranja)
+        lighting_analysis = integrated_results.get('v2_1_lighting_analysis')
+        if lighting_analysis and lighting_analysis['suspicious_regions_count'] > 0:
+            for x, y, w, h in lighting_analysis['suspicious_regions']:
+                cv2.rectangle(highlighted, (x, y), (x+w, y+h), (0, 165, 255), 2)
+        
+        # NOVO: Bordas artificiais (ciano)
+        edge_analysis = integrated_results.get('v2_2_edge_analysis')
+        if edge_analysis:
+            artificial_edge_mask = edge_analysis['artificial_edge_mask']
+            if artificial_edge_mask is not None:
+                artificial_resized = cv2.resize(artificial_edge_mask, (width, height), interpolation=cv2.INTER_NEAREST)
+                
+                # Destacar áreas com bordas artificiais
+                edge_contours, _ = cv2.findContours(artificial_resized, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                for contour in edge_contours:
+                    area = cv2.contourArea(contour)
+                    if area > 200:
+                        x, y, w, h = cv2.boundingRect(contour)
+                        cv2.rectangle(highlighted, (x, y), (x+w, y+h), (255, 255, 0), 2)  # Ciano
+        
+        category, _ = integrated_results['final_category']
+        
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        y_offset = 30
+        
+        cv2.putText(highlighted, f"Score: {score}/100", (10, y_offset), font, 0.7, (255, 255, 255), 2)
+        y_offset += 30
+        
+        cv2.putText(highlighted, category, (10, y_offset), font, 0.7, (255, 255, 255), 2)
+        y_offset += 30
+        
+        cv2.putText(highlighted, f"Excluido: {integrated_results['v2_exclusion_percentage']:.1f}%", 
+                   (10, y_offset), font, 0.6, (0, 255, 0), 2)
+        y_offset += 30
+        
+        # Penalidade de iluminação
+        lighting_penalty = integrated_results.get('v2_1_lighting_score_penalty', 0)
+        if lighting_penalty > 0:
+            cv2.putText(highlighted, f"Luz: -{lighting_penalty}pts", 
+                       (10, y_offset), font, 0.6, (0, 165, 255), 2)
+            y_offset += 30
+        
+        # NOVO: Penalidade de bordas
+        edge_penalty = integrated_results.get('v2_2_edge_score_penalty', 0)
+        if edge_penalty > 0:
+            cv2.putText(highlighted, f"Bordas: -{edge_penalty}pts", 
+                       (10, y_offset), font, 0.6, (255, 255, 0), 2)
+        
+        return highlighted, heatmap), (x+w, y+h), (0, 255, 0), 2)
         
         # NOVO: Marcar inconsistências de iluminação (laranja)
         lighting_analysis = integrated_results.get('v2_1_lighting_analysis')
