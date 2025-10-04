@@ -1,11 +1,10 @@
 # integrated_analyzer.py
 """
-MirrorGlass V2.2 - Analisador Integrado
-Combina:
-- V2: Detecção de elementos legítimos (texto/papel/reflexos)
-- V2.1: Análise de iluminação (sombras/highlights/direção)
-- V2.2: Análise de bordas/contornos (NOVO)
-- V1: Análise de textura LBP
+MirrorGlass V2.3 - Analisador AGRESSIVO para detecção de IA
+Ajustes críticos:
+- Penalidades MUITO maiores
+- Detecção de bordas focada em inpainting de IA
+- Score invertido para privilegiar detecção de fraudes
 """
 
 import cv2
@@ -298,158 +297,236 @@ class LegitimateElementDetector:
 
 
 class EdgeAnalyzer:
-    """V2.2: Analisa bordas e contornos suspeitos"""
+    """
+    V2.3: Detecção AGRESSIVA de bordas de inpainting
+    Foco: detectar transições artificiais de IA, NÃO bordas naturais de objetos
+    """
     
     def __init__(self, debug=False):
         self.debug = debug
     
     def analyze_edges(self, image: np.ndarray) -> Dict:
-        """Analisa bordas para detectar manipulações por IA"""
+        """Analisa bordas FOCANDO em artefatos de IA"""
         if image is None or image.size == 0:
             raise ValueError("Imagem inválida")
         
         h, w = image.shape[:2]
         
         if self.debug:
-            print("\n--- Análise de Bordas ---")
+            print("\n--- Análise de Bordas (AGRESSIVA) ---")
         
-        canny_edges = self._detect_canny_edges(image)
-        smooth_edges = self._detect_smooth_edges(image)
-        edge_smoothness_score = self._calculate_edge_smoothness(image, canny_edges)
-        suspicious_transitions = self._detect_suspicious_transitions(image)
-        gradient_anomaly_score = self._detect_perfect_gradients(image)
-        artificial_edge_mask = self._create_artificial_edge_mask(smooth_edges, suspicious_transitions)
+        # NOVA ABORDAGEM: Detectar inpainting especificamente
+        inpainting_score = self._detect_inpainting_artifacts(image)
+        blend_artifact_score = self._detect_blend_artifacts(image)
+        frequency_anomaly_score = self._detect_frequency_anomalies(image)
         
+        # Score combinado MUITO mais agressivo
         edge_artifact_score = (
-            edge_smoothness_score * 0.4 +
-            gradient_anomaly_score * 0.4 +
-            (np.sum(artificial_edge_mask > 0) / (h * w)) * 0.2
+            inpainting_score * 0.5 +      # Peso ALTO para inpainting
+            blend_artifact_score * 0.3 +   # Peso MÉDIO para blending
+            frequency_anomaly_score * 0.2  # Peso BAIXO para frequência
         )
         
         if self.debug:
-            print(f"Edge Artifact Score: {edge_artifact_score:.2%}")
+            print(f"Inpainting: {inpainting_score:.2%}")
+            print(f"Blend: {blend_artifact_score:.2%}")
+            print(f"Frequency: {frequency_anomaly_score:.2%}")
+            print(f"TOTAL Edge Artifact: {edge_artifact_score:.2%}")
+        
+        # Criar máscara combinada
+        artificial_edge_mask = self._create_inpainting_mask(image, inpainting_score)
         
         return {
             'edge_artifact_score': float(edge_artifact_score),
-            'edge_smoothness_score': float(edge_smoothness_score),
-            'gradient_anomaly_score': float(gradient_anomaly_score),
+            'inpainting_score': float(inpainting_score),
+            'blend_artifact_score': float(blend_artifact_score),
+            'frequency_anomaly_score': float(frequency_anomaly_score),
             'artificial_edge_mask': artificial_edge_mask,
-            'canny_edges': canny_edges,
-            'smooth_edges': smooth_edges
+            'canny_edges': None,
+            'smooth_edges': None
         }
     
-    def _detect_canny_edges(self, image: np.ndarray) -> np.ndarray:
+    def _detect_inpainting_artifacts(self, image: np.ndarray) -> float:
+        """
+        Detecta artefatos específicos de inpainting por IA
+        
+        Características:
+        - Transições em forma de "halo" ao redor da área editada
+        - Mudança brusca de textura mas gradiente suave de cor
+        - Padrões repetitivos ao redor da borda
+        """
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        blurred = cv2.GaussianBlur(gray, (3, 3), 0)
-        edges = cv2.Canny(blurred, 50, 150)
-        return edges
+        h, w = gray.shape
+        
+        # 1. Detectar mudanças de TEXTURA (não cor)
+        # Calcular desvio padrão local (textura)
+        kernel_size = 15
+        gray_float = gray.astype(np.float32)
+        
+        mean = cv2.blur(gray_float, (kernel_size, kernel_size))
+        mean_sq = cv2.blur(gray_float**2, (kernel_size, kernel_size))
+        variance = mean_sq - mean**2
+        variance = np.maximum(variance, 0)
+        texture_map = np.sqrt(variance)
+        
+        # 2. Detectar mudanças ABRUPTAS de textura
+        texture_grad_x = cv2.Sobel(texture_map, cv2.CV_64F, 1, 0, ksize=5)
+        texture_grad_y = cv2.Sobel(texture_map, cv2.CV_64F, 0, 1, ksize=5)
+        texture_change = np.sqrt(texture_grad_x**2 + texture_grad_y**2)
+        
+        # 3. Detectar gradiente SUAVE de cor (característico de blend de IA)
+        color_grad_x = cv2.Sobel(gray_float, cv2.CV_64F, 1, 0, ksize=5)
+        color_grad_y = cv2.Sobel(gray_float, cv2.CV_64F, 0, 1, ksize=5)
+        color_change = np.sqrt(color_grad_x**2 + color_grad_y**2)
+        
+        # CRÍTICO: Inpainting tem ALTA mudança de textura + BAIXA mudança de cor
+        texture_norm = cv2.normalize(texture_change, None, 0, 1, cv2.NORM_MINMAX)
+        color_norm = cv2.normalize(color_change, None, 0, 1, cv2.NORM_MINMAX)
+        
+        # Áreas suspeitas: textura muda muito, cor muda pouco
+        inpainting_indicator = texture_norm * (1 - color_norm)
+        
+        # Calcular score
+        threshold = 0.3
+        suspicious_ratio = np.sum(inpainting_indicator > threshold) / (h * w)
+        
+        # Se > 5% da imagem tem esse padrão = MUITO suspeito
+        if suspicious_ratio > 0.15:
+            return 0.9
+        elif suspicious_ratio > 0.08:
+            return 0.7
+        elif suspicious_ratio > 0.03:
+            return 0.4
+        else:
+            return suspicious_ratio * 5  # Escalar linearmente
     
-    def _detect_smooth_edges(self, image: np.ndarray) -> np.ndarray:
+    def _detect_blend_artifacts(self, image: np.ndarray) -> float:
+        """
+        Detecta artefatos de blending (mistura) de IA
+        
+        IA usa blending gaussiano perfeito que é detectável
+        """
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        blurred = cv2.GaussianBlur(gray, (9, 9), 0)
-        smooth_edges = cv2.Canny(blurred, 30, 100)
-        return smooth_edges
+        h, w = gray.shape
+        
+        # Aplicar Laplaciano em múltiplas escalas
+        # IA deixa "resíduo" característico
+        laplacians = []
+        
+        for sigma in [1, 2, 4]:
+            blurred = cv2.GaussianBlur(gray, (0, 0), sigma)
+            laplacian = cv2.Laplacian(blurred, cv2.CV_64F, ksize=5)
+            laplacians.append(np.abs(laplacian))
+        
+        # Comparar laplacianos em diferentes escalas
+        # Blending de IA tem razão específica entre escalas
+        ratio_12 = laplacians[0] / (laplacians[1] + 1e-7)
+        ratio_23 = laplacians[1] / (laplacians[2] + 1e-7)
+        
+        # Normalizar
+        ratio_12_norm = cv2.normalize(ratio_12, None, 0, 1, cv2.NORM_MINMAX)
+        ratio_23_norm = cv2.normalize(ratio_23, None, 0, 1, cv2.NORM_MINMAX)
+        
+        # Áreas com razões muito uniformes = blending artificial
+        variance_r12 = np.var(ratio_12_norm)
+        variance_r23 = np.var(ratio_23_norm)
+        
+        # Blending de IA tem BAIXA variância
+        blend_score = 0
+        
+        if variance_r12 < 0.01 and variance_r23 < 0.01:
+            blend_score = 0.8
+        elif variance_r12 < 0.03 or variance_r23 < 0.03:
+            blend_score = 0.5
+        elif variance_r12 < 0.05 or variance_r23 < 0.05:
+            blend_score = 0.3
+        else:
+            blend_score = max(0, 0.3 - variance_r12 - variance_r23)
+        
+        return float(blend_score)
     
-    def _calculate_edge_smoothness(self, image: np.ndarray, edges: np.ndarray) -> float:
-        if np.sum(edges) == 0:
-            return 0.0
+    def _detect_frequency_anomalies(self, image: np.ndarray) -> float:
+        """
+        Detecta anomalias de frequência (FFT simplificado)
         
-        contours, _ = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE)
+        IA deixa "impressão digital" em certas frequências
+        """
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        h, w = gray.shape
         
-        if not contours:
-            return 0.0
+        # Dividir em patches e analisar
+        patch_size = 64
+        anomaly_count = 0
+        total_patches = 0
         
-        smoothness_scores = []
+        for i in range(0, h - patch_size, patch_size):
+            for j in range(0, w - patch_size, patch_size):
+                patch = gray[i:i+patch_size, j:j+patch_size]
+                
+                if patch.shape[0] != patch_size or patch.shape[1] != patch_size:
+                    continue
+                
+                total_patches += 1
+                
+                # Análise espectral simplificada
+                # Calcular energia em diferentes frequências
+                high_freq = cv2.Laplacian(patch, cv2.CV_64F)
+                low_freq = cv2.GaussianBlur(patch, (5, 5), 0)
+                
+                high_energy = np.sum(np.abs(high_freq))
+                low_energy = np.sum(np.abs(patch.astype(float) - low_freq))
+                
+                # Razão anômala = possível IA
+                if high_energy > 0:
+                    ratio = low_energy / high_energy
+                    
+                    # IA tende a ter razão específica
+                    if 0.8 < ratio < 1.2:
+                        anomaly_count += 1
         
-        for contour in contours:
-            if len(contour) < 20:
-                continue
+        if total_patches > 0:
+            anomaly_ratio = anomaly_count / total_patches
             
-            epsilon = 0.01 * cv2.arcLength(contour, True)
-            approx = cv2.approxPolyDP(contour, epsilon, True)
-            smoothness = len(approx) / len(contour)
-            smoothness_scores.append(smoothness)
-        
-        if smoothness_scores:
-            avg_smoothness = np.mean(smoothness_scores)
-            
-            if avg_smoothness < 0.15:
-                return 0.8
-            elif avg_smoothness < 0.25:
+            if anomaly_ratio > 0.6:
+                return 0.7
+            elif anomaly_ratio > 0.4:
                 return 0.5
             else:
-                return 0.2
+                return anomaly_ratio
         
         return 0.0
     
-    def _detect_suspicious_transitions(self, image: np.ndarray) -> np.ndarray:
+    def _create_inpainting_mask(self, image: np.ndarray, inpainting_score: float) -> np.ndarray:
+        """Cria máscara de áreas com inpainting"""
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         h, w = gray.shape
         
-        suspicious_mask = np.zeros((h, w), dtype=np.uint8)
+        # Se score alto, marcar áreas suspeitas
+        if inpainting_score < 0.3:
+            return np.zeros((h, w), dtype=np.uint8)
         
-        grad_x = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=5)
-        grad_y = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=5)
+        # Detectar áreas com textura anômala
+        kernel_size = 15
+        gray_float = gray.astype(np.float32)
         
-        magnitude = np.sqrt(grad_x**2 + grad_y**2)
-        magnitude_norm = cv2.normalize(magnitude, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+        mean = cv2.blur(gray_float, (kernel_size, kernel_size))
+        mean_sq = cv2.blur(gray_float**2, (kernel_size, kernel_size))
+        variance = mean_sq - mean**2
+        variance = np.maximum(variance, 0)
+        texture_map = np.sqrt(variance)
         
-        block_size = 32
+        texture_grad_x = cv2.Sobel(texture_map, cv2.CV_64F, 1, 0, ksize=5)
+        texture_grad_y = cv2.Sobel(texture_map, cv2.CV_64F, 0, 1, ksize=5)
+        texture_change = np.sqrt(texture_grad_x**2 + texture_grad_y**2)
         
-        for i in range(0, h - block_size, block_size // 2):
-            for j in range(0, w - block_size, block_size // 2):
-                block_grad = magnitude_norm[i:i+block_size, j:j+block_size]
-                
-                if block_grad.size == 0:
-                    continue
-                
-                grad_var = np.var(block_grad)
-                
-                if grad_var < 50:
-                    mean_grad = np.mean(block_grad)
-                    
-                    if mean_grad > 20:
-                        suspicious_mask[i:i+block_size, j:j+block_size] = 255
+        texture_norm = cv2.normalize(texture_change, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
         
-        return suspicious_mask
-    
-    def _detect_perfect_gradients(self, image: np.ndarray) -> float:
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        h, w = gray.shape
+        _, mask = cv2.threshold(texture_norm, 80, 255, cv2.THRESH_BINARY)
         
-        laplacian = cv2.Laplacian(gray, cv2.CV_64F, ksize=5)
-        laplacian_abs = np.abs(laplacian)
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+        mask = cv2.dilate(mask, kernel, iterations=2)
         
-        block_size = 64
-        perfect_gradient_ratio = 0
-        total_blocks = 0
-        
-        for i in range(0, h - block_size, block_size):
-            for j in range(0, w - block_size, block_size):
-                block_lap = laplacian_abs[i:i+block_size, j:j+block_size]
-                
-                if block_lap.size == 0:
-                    continue
-                
-                total_blocks += 1
-                
-                low_laplacian_ratio = np.sum(block_lap < 5) / block_lap.size
-                
-                if low_laplacian_ratio > 0.6:
-                    block_gray = gray[i:i+block_size, j:j+block_size]
-                    if np.std(block_gray) > 10:
-                        perfect_gradient_ratio += 1
-        
-        if total_blocks > 0:
-            return perfect_gradient_ratio / total_blocks
-        
-        return 0.0
-    
-    def _create_artificial_edge_mask(self, smooth_edges: np.ndarray, suspicious_transitions: np.ndarray) -> np.ndarray:
-        artificial_mask = cv2.bitwise_or(smooth_edges, suspicious_transitions)
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-        artificial_mask = cv2.dilate(artificial_mask, kernel, iterations=1)
-        return artificial_mask
+        return mask
 
 
 class LightingAnalyzer:
@@ -464,9 +541,6 @@ class LightingAnalyzer:
         
         h, w = image.shape[:2]
         
-        if self.debug:
-            print("\n--- Análise de Iluminação ---")
-        
         shadow_map = self._detect_shadows(image)
         highlight_map = self._detect_highlights(image)
         lighting_direction_map = self._calculate_lighting_directions(image)
@@ -474,9 +548,6 @@ class LightingAnalyzer:
             image, shadow_map, highlight_map, lighting_direction_map
         )
         suspicious_regions = self._find_suspicious_regions(inconsistency_mask)
-        
-        if self.debug:
-            print(f"Lighting Inconsistency: {inconsistency_score:.2%}")
         
         return LightingAnalysisResult(
             inconsistency_mask=inconsistency_mask,
@@ -559,10 +630,6 @@ class LightingAnalyzer:
         inconsistency_mask = cv2.bitwise_or(inconsistency_mask, highlight_orphan_mask)
         metadata['orphan_highlights_ratio'] = float(np.sum(highlight_orphan_mask > 0) / (h * w))
         
-        direction_conflict_mask = self._detect_direction_conflicts(lighting_direction_map, block_size=64)
-        inconsistency_mask = cv2.bitwise_or(inconsistency_mask, direction_conflict_mask)
-        metadata['direction_conflicts_ratio'] = float(np.sum(direction_conflict_mask > 0) / (h * w))
-        
         transition_mask = self._detect_abrupt_transitions(image)
         inconsistency_mask = cv2.bitwise_or(inconsistency_mask, transition_mask)
         metadata['abrupt_transitions_ratio'] = float(np.sum(transition_mask > 0) / (h * w))
@@ -572,10 +639,9 @@ class LightingAnalyzer:
         metadata['shadow_anomalies_ratio'] = float(np.sum(shadow_anomaly_mask > 0) / (h * w))
         
         inconsistency_score = (
-            metadata['orphan_highlights_ratio'] * 0.3 +
-            metadata['direction_conflicts_ratio'] * 0.4 +
-            metadata['abrupt_transitions_ratio'] * 0.2 +
-            metadata['shadow_anomalies_ratio'] * 0.1
+            metadata['orphan_highlights_ratio'] * 0.4 +
+            metadata['abrupt_transitions_ratio'] * 0.4 +
+            metadata['shadow_anomalies_ratio'] * 0.2
         )
         
         metadata['total_inconsistency_ratio'] = float(np.sum(inconsistency_mask > 0) / (h * w))
@@ -614,45 +680,6 @@ class LightingAnalyzer:
                     cv2.drawContours(orphan_mask, [contour], -1, 255, -1)
         
         return orphan_mask
-    
-    def _detect_direction_conflicts(self, lighting_direction_map, block_size=64) -> np.ndarray:
-        h, w = lighting_direction_map.shape
-        conflict_mask = np.zeros((h, w), dtype=np.uint8)
-        
-        block_directions = []
-        
-        for i in range(0, h - block_size, block_size // 2):
-            for j in range(0, w - block_size, block_size // 2):
-                block = lighting_direction_map[i:i+block_size, j:j+block_size]
-                valid_angles = block[block >= 0]
-                
-                if len(valid_angles) > block_size * block_size * 0.3:
-                    mean_angle = self._circular_mean(valid_angles)
-                    block_directions.append({
-                        'bbox': (j, i, block_size, block_size),
-                        'angle': mean_angle,
-                        'valid_ratio': len(valid_angles) / block.size
-                    })
-        
-        for i, block1 in enumerate(block_directions):
-            for block2 in block_directions[i+1:]:
-                if self._are_adjacent(block1['bbox'], block2['bbox']):
-                    angle_diff = abs(block1['angle'] - block2['angle'])
-                    angle_diff = min(angle_diff, 360 - angle_diff)
-                    
-                    if angle_diff > 90:
-                        x1, y1, w1, h1 = block1['bbox']
-                        x2, y2, w2, h2 = block2['bbox']
-                        
-                        overlap_x1 = max(x1, x2)
-                        overlap_y1 = max(y1, y2)
-                        overlap_x2 = min(x1 + w1, x2 + w2)
-                        overlap_y2 = min(y1 + h1, y2 + h2)
-                        
-                        if overlap_x2 > overlap_x1 and overlap_y2 > overlap_y1:
-                            conflict_mask[overlap_y1:overlap_y2, overlap_x1:overlap_x2] = 255
-        
-        return conflict_mask
     
     def _detect_abrupt_transitions(self, image) -> np.ndarray:
         lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
@@ -706,26 +733,17 @@ class LightingAnalyzer:
                 suspicious_regions.append((int(x), int(y), int(w), int(h)))
         
         return suspicious_regions
-    
-    def _circular_mean(self, angles) -> float:
-        angles_rad = np.radians(angles)
-        sin_mean = np.mean(np.sin(angles_rad))
-        cos_mean = np.mean(np.cos(angles_rad))
-        mean_rad = np.arctan2(sin_mean, cos_mean)
-        return float(np.degrees(mean_rad) % 360)
-    
-    def _are_adjacent(self, bbox1, bbox2, max_gap=10) -> bool:
-        x1, y1, w1, h1 = bbox1
-        x2, y2, w2, h2 = bbox2
-        
-        x_adjacent = ((x1 <= x2 <= x1 + w1 + max_gap) or (x2 <= x1 <= x2 + w2 + max_gap))
-        y_adjacent = ((y1 <= y2 <= y1 + h1 + max_gap) or (y2 <= y1 <= y2 + h2 + max_gap))
-        
-        return x_adjacent and y_adjacent
 
 
 class IntegratedTextureAnalyzer:
-    """Analisador integrado V2.2"""
+    """
+    Analisador integrado V2.3 AGRESSIVO
+    
+    MUDANÇAS CRÍTICAS:
+    - Penalidades MUITO maiores para bordas e iluminação
+    - Detecção de bordas focada em inpainting (não bordas naturais)
+    - Score privilegia detecção de fraudes
+    """
     
     def __init__(self, P=8, R=1, block_size=20, threshold=0.50, 
                  enable_lighting_analysis=True, enable_edge_analysis=True, debug=False):
@@ -741,10 +759,11 @@ class IntegratedTextureAnalyzer:
         self.edge_analyzer = EdgeAnalyzer(debug=debug) if enable_edge_analysis else None
     
     def analyze_image_integrated(self, image):
-        """Análise integrada V2.2"""
+        """Análise integrada V2.3 AGRESSIVA"""
         if self.debug:
-            print("\n=== ANÁLISE INTEGRADA V2.2 ===")
+            print("\n=== ANÁLISE V2.3 AGRESSIVA ===")
         
+        # FASE 1: Elementos legítimos
         legitimate_elements = self.legitimate_detector.detect_all(image)
         exclusion_mask = self.legitimate_detector.create_exclusion_mask(image.shape[:2], min_confidence=0.3)
         
@@ -756,13 +775,16 @@ class IntegratedTextureAnalyzer:
         if self.debug:
             print(f"FASE 1: Excluído: {exclusion_percentage:.1f}%")
         
+        # FASE 2: Iluminação (penalidade AUMENTADA)
         lighting_result = None
         lighting_score_penalty = 0
         
         if self.enable_lighting_analysis and self.lighting_analyzer:
             try:
                 lighting_result = self.lighting_analyzer.analyze_lighting(image)
-                lighting_score_penalty = int(lighting_result.inconsistency_score * 25)
+                
+                # PENALIDADE AGRESSIVA (até -40 pontos)
+                lighting_score_penalty = int(lighting_result.inconsistency_score * 40)
                 
                 if self.debug:
                     print(f"FASE 2: Luz penalty: -{lighting_score_penalty}")
@@ -770,6 +792,7 @@ class IntegratedTextureAnalyzer:
                 if self.debug:
                     print(f"Erro luz: {e}")
         
+        # FASE 3: BORDAS AGRESSIVAS (penalidade MUITO AUMENTADA)
         edge_result = None
         edge_score_penalty = 0
         
@@ -778,24 +801,31 @@ class IntegratedTextureAnalyzer:
                 edge_result = self.edge_analyzer.analyze_edges(image)
                 edge_artifact = edge_result['edge_artifact_score']
                 
-                if edge_artifact > 0.6:
-                    edge_score_penalty = 35
-                elif edge_artifact > 0.4:
-                    edge_score_penalty = 25
-                elif edge_artifact > 0.2:
-                    edge_score_penalty = 15
+                # SISTEMA DE PENALIDADE AGRESSIVO
+                # Score alto de artefato = penalidade ENORME
+                if edge_artifact > 0.7:
+                    edge_score_penalty = 50  # PENALIDADE MÁXIMA
+                elif edge_artifact > 0.5:
+                    edge_score_penalty = 40
+                elif edge_artifact > 0.3:
+                    edge_score_penalty = 30
+                elif edge_artifact > 0.15:
+                    edge_score_penalty = 20
                 else:
-                    edge_score_penalty = 5
+                    edge_score_penalty = int(edge_artifact * 100)
                 
                 if self.debug:
-                    print(f"FASE 3: Edge penalty: -{edge_score_penalty}")
+                    print(f"FASE 3: Edge artifact: {edge_artifact:.2%} → penalty: -{edge_score_penalty}")
             except Exception as e:
                 if self.debug:
                     print(f"Erro bordas: {e}")
         
+        # FASE 4: Textura LBP
         texture_results = self._analyze_texture_with_mask(image, exclusion_mask)
         
         base_score = texture_results['naturalness_score']
+        
+        # SCORE FINAL COM PENALIDADES AGRESSIVAS
         final_score = max(0, base_score - lighting_score_penalty - edge_score_penalty)
         
         integrated_results = {
@@ -814,7 +844,12 @@ class IntegratedTextureAnalyzer:
         }
         
         if self.debug:
-            print(f"Score final: {final_score}")
+            print(f"\nRESULTADO:")
+            print(f"  Base: {base_score}")
+            print(f"  Luz: -{lighting_score_penalty}")
+            print(f"  Bordas: -{edge_score_penalty}")
+            print(f"  FINAL: {final_score}")
+            print(f"  Categoria: {integrated_results['final_category'][0]}")
         
         return integrated_results
     
