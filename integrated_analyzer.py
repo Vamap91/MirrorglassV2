@@ -1,17 +1,18 @@
 # integrated_analyzer.py
 """
-MirrorGlass V2.1 - Analisador Integrado
+MirrorGlass V2.2 - Analisador Integrado
 Combina:
 - V2: Detecção de elementos legítimos (texto/papel/reflexos)
+- V2.1: Análise de iluminação (sombras/highlights/direção)
+- V2.2: Análise de bordas/contornos (NOVO)
 - V1: Análise de textura LBP
-- NOVO: Análise de iluminação (sombras/highlights/direção)
 """
 
 import cv2
 import numpy as np
 from typing import Dict, Tuple, Optional, List
 import pytesseract
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from skimage.feature import local_binary_pattern
 from scipy.stats import entropy
 
@@ -30,7 +31,7 @@ class RegionInfo:
 class LightingAnalysisResult:
     """Resultados da análise de iluminação"""
     inconsistency_mask: np.ndarray
-    inconsistency_score: float  # 0-1 (0 = consistente, 1 = inconsistente)
+    inconsistency_score: float
     shadow_map: np.ndarray
     highlight_map: np.ndarray
     lighting_direction_map: np.ndarray
@@ -297,23 +298,13 @@ class LegitimateElementDetector:
 
 
 class EdgeAnalyzer:
-    """
-    NOVO - V2.2: Analisa bordas e contornos suspeitos
-    Detecta transições artificiais características de IA
-    """
+    """V2.2: Analisa bordas e contornos suspeitos"""
     
     def __init__(self, debug=False):
         self.debug = debug
     
     def analyze_edges(self, image: np.ndarray) -> Dict:
-        """
-        Analisa bordas para detectar manipulações por IA
-        
-        IAs como Gemini/Midjourney criam:
-        - Bordas suaves demais (sem ruído natural)
-        - Gradientes perfeitos
-        - Transições artificiais
-        """
+        """Analisa bordas para detectar manipulações por IA"""
         if image is None or image.size == 0:
             raise ValueError("Imagem inválida")
         
@@ -322,26 +313,13 @@ class EdgeAnalyzer:
         if self.debug:
             print("\n--- Análise de Bordas ---")
         
-        # 1. Detectar bordas com múltiplos métodos
         canny_edges = self._detect_canny_edges(image)
         smooth_edges = self._detect_smooth_edges(image)
-        
-        # 2. Analisar qualidade das bordas
         edge_smoothness_score = self._calculate_edge_smoothness(image, canny_edges)
-        
-        # 3. Detectar transições suspeitas
         suspicious_transitions = self._detect_suspicious_transitions(image)
-        
-        # 4. Análise de gradientes (bordas perfeitas demais)
         gradient_anomaly_score = self._detect_perfect_gradients(image)
+        artificial_edge_mask = self._create_artificial_edge_mask(smooth_edges, suspicious_transitions)
         
-        # 5. Detectar áreas com bordas artificiais
-        artificial_edge_mask = self._create_artificial_edge_mask(
-            smooth_edges, suspicious_transitions
-        )
-        
-        # Score final de artificialidade de bordas (0-1)
-        # Quanto maior, mais artificial
         edge_artifact_score = (
             edge_smoothness_score * 0.4 +
             gradient_anomaly_score * 0.4 +
@@ -349,8 +327,6 @@ class EdgeAnalyzer:
         )
         
         if self.debug:
-            print(f"Edge Smoothness: {edge_smoothness_score:.2%}")
-            print(f"Gradient Anomaly: {gradient_anomaly_score:.2%}")
             print(f"Edge Artifact Score: {edge_artifact_score:.2%}")
         
         return {
@@ -363,40 +339,21 @@ class EdgeAnalyzer:
         }
     
     def _detect_canny_edges(self, image: np.ndarray) -> np.ndarray:
-        """Detecta bordas usando Canny"""
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        
-        # Suavizar levemente para reduzir ruído
         blurred = cv2.GaussianBlur(gray, (3, 3), 0)
-        
-        # Canny com thresholds ajustados
         edges = cv2.Canny(blurred, 50, 150)
-        
         return edges
     
     def _detect_smooth_edges(self, image: np.ndarray) -> np.ndarray:
-        """Detecta bordas muito suaves (característica de IA)"""
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        
-        # Suavizar mais agressivamente
         blurred = cv2.GaussianBlur(gray, (9, 9), 0)
-        
-        # Detectar bordas no blur
         smooth_edges = cv2.Canny(blurred, 30, 100)
-        
         return smooth_edges
     
     def _calculate_edge_smoothness(self, image: np.ndarray, edges: np.ndarray) -> float:
-        """
-        Calcula quão suaves são as bordas
-        
-        Bordas naturais têm ruído/irregularidade
-        Bordas de IA são suaves demais
-        """
         if np.sum(edges) == 0:
             return 0.0
         
-        # Encontrar contornos
         contours, _ = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE)
         
         if not contours:
@@ -405,25 +362,17 @@ class EdgeAnalyzer:
         smoothness_scores = []
         
         for contour in contours:
-            if len(contour) < 20:  # Ignorar contornos muito pequenos
+            if len(contour) < 20:
                 continue
             
-            # Calcular curvatura (segunda derivada)
-            # Contornos suaves têm curvatura baixa e constante
             epsilon = 0.01 * cv2.arcLength(contour, True)
             approx = cv2.approxPolyDP(contour, epsilon, True)
-            
-            # Razão entre contorno aproximado e original
-            # Quanto menor, mais suave
             smoothness = len(approx) / len(contour)
             smoothness_scores.append(smoothness)
         
         if smoothness_scores:
-            # Média de suavidade (valores baixos = muito suave = suspeito)
             avg_smoothness = np.mean(smoothness_scores)
             
-            # Inverter: quanto menor smoothness, maior o score de suspeita
-            # Se smoothness < 0.1 = bordas MUITO suaves = score alto
             if avg_smoothness < 0.15:
                 return 0.8
             elif avg_smoothness < 0.25:
@@ -434,28 +383,17 @@ class EdgeAnalyzer:
         return 0.0
     
     def _detect_suspicious_transitions(self, image: np.ndarray) -> np.ndarray:
-        """
-        Detecta transições de cor/brilho suspeitas
-        
-        IA cria transições lineares perfeitas
-        Fotos reais têm transições irregulares
-        """
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         h, w = gray.shape
         
         suspicious_mask = np.zeros((h, w), dtype=np.uint8)
         
-        # Calcular gradiente direcional
         grad_x = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=5)
         grad_y = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=5)
         
         magnitude = np.sqrt(grad_x**2 + grad_y**2)
-        
-        # Normalizar
         magnitude_norm = cv2.normalize(magnitude, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
         
-        # Detectar regiões com gradiente uniforme demais
-        # Dividir em blocos e calcular variância do gradiente
         block_size = 32
         
         for i in range(0, h - block_size, block_size // 2):
@@ -465,35 +403,23 @@ class EdgeAnalyzer:
                 if block_grad.size == 0:
                     continue
                 
-                # Calcular variância do gradiente
                 grad_var = np.var(block_grad)
                 
-                # Se gradiente muito uniforme = suspeito
                 if grad_var < 50:
                     mean_grad = np.mean(block_grad)
                     
-                    # Se tem gradiente mas é uniforme = transição artificial
                     if mean_grad > 20:
                         suspicious_mask[i:i+block_size, j:j+block_size] = 255
         
         return suspicious_mask
     
     def _detect_perfect_gradients(self, image: np.ndarray) -> float:
-        """
-        Detecta gradientes 'perfeitos demais'
-        
-        IA cria gradientes matematicamente perfeitos
-        Fotos reais têm imperfeições
-        """
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         h, w = gray.shape
         
-        # Calcular Laplaciano (segunda derivada)
-        # Gradientes lineares têm Laplaciano próximo de zero
         laplacian = cv2.Laplacian(gray, cv2.CV_64F, ksize=5)
         laplacian_abs = np.abs(laplacian)
         
-        # Dividir imagem em regiões
         block_size = 64
         perfect_gradient_ratio = 0
         total_blocks = 0
@@ -507,13 +433,9 @@ class EdgeAnalyzer:
                 
                 total_blocks += 1
                 
-                # Calcular quantos pixels têm Laplaciano muito baixo
-                # (indicando gradiente linear perfeito)
                 low_laplacian_ratio = np.sum(block_lap < 5) / block_lap.size
                 
-                # Se mais de 60% dos pixels têm gradiente linear = suspeito
                 if low_laplacian_ratio > 0.6:
-                    # Mas deve ter alguma variação (não ser uniforme)
                     block_gray = gray[i:i+block_size, j:j+block_size]
                     if np.std(block_gray) > 10:
                         perfect_gradient_ratio += 1
@@ -523,34 +445,20 @@ class EdgeAnalyzer:
         
         return 0.0
     
-    def _create_artificial_edge_mask(
-        self, 
-        smooth_edges: np.ndarray,
-        suspicious_transitions: np.ndarray
-    ) -> np.ndarray:
-        """Combina detecções para criar máscara de bordas artificiais"""
-        
-        # Combinar bordas suaves com transições suspeitas
+    def _create_artificial_edge_mask(self, smooth_edges: np.ndarray, suspicious_transitions: np.ndarray) -> np.ndarray:
         artificial_mask = cv2.bitwise_or(smooth_edges, suspicious_transitions)
-        
-        # Dilatar um pouco para marcar região ao redor
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
         artificial_mask = cv2.dilate(artificial_mask, kernel, iterations=1)
-        
         return artificial_mask
 
 
 class LightingAnalyzer:
-    """
-    NOVO - V2.1: Analisa inconsistências de iluminação
-    Detecta sombras, highlights e direção da luz
-    """
+    """V2.1: Analisa inconsistências de iluminação"""
     
     def __init__(self, debug=False):
         self.debug = debug
         
     def analyze_lighting(self, image: np.ndarray) -> LightingAnalysisResult:
-        """Análise completa de iluminação"""
         if image is None or image.size == 0:
             raise ValueError("Imagem inválida")
         
@@ -559,26 +467,16 @@ class LightingAnalyzer:
         if self.debug:
             print("\n--- Análise de Iluminação ---")
         
-        # 1. Detectar sombras
         shadow_map = self._detect_shadows(image)
-        
-        # 2. Detectar highlights
         highlight_map = self._detect_highlights(image)
-        
-        # 3. Calcular direção da luz
         lighting_direction_map = self._calculate_lighting_directions(image)
-        
-        # 4. Detectar inconsistências
         inconsistency_mask, inconsistency_score, metadata = self._detect_inconsistencies(
             image, shadow_map, highlight_map, lighting_direction_map
         )
-        
-        # 5. Identificar regiões suspeitas
         suspicious_regions = self._find_suspicious_regions(inconsistency_mask)
         
         if self.debug:
-            print(f"Lighting Inconsistency Score: {inconsistency_score:.2%}")
-            print(f"Suspicious Regions: {len(suspicious_regions)}")
+            print(f"Lighting Inconsistency: {inconsistency_score:.2%}")
         
         return LightingAnalysisResult(
             inconsistency_mask=inconsistency_mask,
@@ -591,7 +489,6 @@ class LightingAnalyzer:
         )
     
     def _detect_shadows(self, image: np.ndarray) -> np.ndarray:
-        """Detecta áreas de sombra"""
         hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
         lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
         
@@ -612,7 +509,6 @@ class LightingAnalyzer:
         return shadow_mask
     
     def _detect_highlights(self, image: np.ndarray) -> np.ndarray:
-        """Detecta áreas de highlight"""
         hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
         h, s, v = cv2.split(hsv)
         
@@ -636,7 +532,6 @@ class LightingAnalyzer:
         return highlight_mask
     
     def _calculate_lighting_directions(self, image: np.ndarray) -> np.ndarray:
-        """Calcula direção da luz usando gradientes"""
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         gray_smooth = cv2.GaussianBlur(gray, (5, 5), 0)
         
@@ -654,40 +549,28 @@ class LightingAnalyzer:
         
         return angle_weighted
     
-    def _detect_inconsistencies(
-        self, 
-        image: np.ndarray,
-        shadow_map: np.ndarray,
-        highlight_map: np.ndarray,
-        lighting_direction_map: np.ndarray
-    ) -> Tuple[np.ndarray, float, Dict]:
-        """Detecta inconsistências de iluminação"""
+    def _detect_inconsistencies(self, image, shadow_map, highlight_map, lighting_direction_map) -> Tuple[np.ndarray, float, Dict]:
         h, w = image.shape[:2]
         inconsistency_mask = np.zeros((h, w), dtype=np.uint8)
         
         metadata = {}
         
-        # 1. Highlights órfãos
         highlight_orphan_mask = self._detect_orphan_highlights(image, highlight_map, shadow_map)
         inconsistency_mask = cv2.bitwise_or(inconsistency_mask, highlight_orphan_mask)
         metadata['orphan_highlights_ratio'] = float(np.sum(highlight_orphan_mask > 0) / (h * w))
         
-        # 2. Conflitos de direção
         direction_conflict_mask = self._detect_direction_conflicts(lighting_direction_map, block_size=64)
         inconsistency_mask = cv2.bitwise_or(inconsistency_mask, direction_conflict_mask)
         metadata['direction_conflicts_ratio'] = float(np.sum(direction_conflict_mask > 0) / (h * w))
         
-        # 3. Transições abruptas
         transition_mask = self._detect_abrupt_transitions(image)
         inconsistency_mask = cv2.bitwise_or(inconsistency_mask, transition_mask)
         metadata['abrupt_transitions_ratio'] = float(np.sum(transition_mask > 0) / (h * w))
         
-        # 4. Sombras anômalas
         shadow_anomaly_mask = self._detect_shadow_anomalies(shadow_map)
         inconsistency_mask = cv2.bitwise_or(inconsistency_mask, shadow_anomaly_mask)
         metadata['shadow_anomalies_ratio'] = float(np.sum(shadow_anomaly_mask > 0) / (h * w))
         
-        # Score ponderado
         inconsistency_score = (
             metadata['orphan_highlights_ratio'] * 0.3 +
             metadata['direction_conflicts_ratio'] * 0.4 +
@@ -700,8 +583,7 @@ class LightingAnalyzer:
         
         return inconsistency_mask, inconsistency_score, metadata
     
-    def _detect_orphan_highlights(self, image: np.ndarray, highlight_map: np.ndarray, shadow_map: np.ndarray) -> np.ndarray:
-        """Detecta highlights sem sombras correspondentes"""
+    def _detect_orphan_highlights(self, image, highlight_map, shadow_map) -> np.ndarray:
         h, w = image.shape[:2]
         orphan_mask = np.zeros((h, w), dtype=np.uint8)
         
@@ -733,8 +615,7 @@ class LightingAnalyzer:
         
         return orphan_mask
     
-    def _detect_direction_conflicts(self, lighting_direction_map: np.ndarray, block_size: int = 64) -> np.ndarray:
-        """Detecta direções de luz conflitantes"""
+    def _detect_direction_conflicts(self, lighting_direction_map, block_size=64) -> np.ndarray:
         h, w = lighting_direction_map.shape
         conflict_mask = np.zeros((h, w), dtype=np.uint8)
         
@@ -773,8 +654,7 @@ class LightingAnalyzer:
         
         return conflict_mask
     
-    def _detect_abrupt_transitions(self, image: np.ndarray) -> np.ndarray:
-        """Detecta transições abruptas de iluminação"""
+    def _detect_abrupt_transitions(self, image) -> np.ndarray:
         lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
         l_channel = lab[:, :, 0]
         
@@ -789,8 +669,7 @@ class LightingAnalyzer:
         
         return transition_mask
     
-    def _detect_shadow_anomalies(self, shadow_map: np.ndarray) -> np.ndarray:
-        """Detecta sombras anômalas (muito uniformes)"""
+    def _detect_shadow_anomalies(self, shadow_map) -> np.ndarray:
         h, w = shadow_map.shape
         anomaly_mask = np.zeros((h, w), dtype=np.uint8)
         
@@ -815,8 +694,7 @@ class LightingAnalyzer:
         
         return anomaly_mask
     
-    def _find_suspicious_regions(self, inconsistency_mask: np.ndarray) -> List[Tuple[int, int, int, int]]:
-        """Identifica bounding boxes das regiões suspeitas"""
+    def _find_suspicious_regions(self, inconsistency_mask) -> List[Tuple[int, int, int, int]]:
         contours, _ = cv2.findContours(inconsistency_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         
         suspicious_regions = []
@@ -829,16 +707,14 @@ class LightingAnalyzer:
         
         return suspicious_regions
     
-    def _circular_mean(self, angles: np.ndarray) -> float:
-        """Calcula média circular de ângulos"""
+    def _circular_mean(self, angles) -> float:
         angles_rad = np.radians(angles)
         sin_mean = np.mean(np.sin(angles_rad))
         cos_mean = np.mean(np.cos(angles_rad))
         mean_rad = np.arctan2(sin_mean, cos_mean)
         return float(np.degrees(mean_rad) % 360)
     
-    def _are_adjacent(self, bbox1: Tuple, bbox2: Tuple, max_gap: int = 10) -> bool:
-        """Verifica se dois bboxes são adjacentes"""
+    def _are_adjacent(self, bbox1, bbox2, max_gap=10) -> bool:
         x1, y1, w1, h1 = bbox1
         x2, y2, w2, h2 = bbox2
         
@@ -849,12 +725,7 @@ class LightingAnalyzer:
 
 
 class IntegratedTextureAnalyzer:
-    """
-    Analisador integrado V2.1
-    - V2: Elementos legítimos
-    - V1: Textura LBP
-    - NOVO: Análise de iluminação
-    """
+    """Analisador integrado V2.2"""
     
     def __init__(self, P=8, R=1, block_size=20, threshold=0.50, 
                  enable_lighting_analysis=True, enable_edge_analysis=True, debug=False):
@@ -870,19 +741,9 @@ class IntegratedTextureAnalyzer:
         self.edge_analyzer = EdgeAnalyzer(debug=debug) if enable_edge_analysis else None
     
     def analyze_image_integrated(self, image):
-        """
-        Análise integrada completa V2.2:
-        1. V2 - Elementos legítimos (texto/papel/reflexo)
-        2. V2.1 - Análise de iluminação
-        3. V2.2 - NOVO: Análise de bordas/contornos
-        4. V1 - Textura LBP
-        """
+        """Análise integrada V2.2"""
         if self.debug:
             print("\n=== ANÁLISE INTEGRADA V2.2 ===")
-        
-        # FASE 1: Detectar elementos legítimos (V2)
-        if self.debug:
-            print("FASE 1: Elementos legítimos (V2)...")
         
         legitimate_elements = self.legitimate_detector.detect_all(image)
         exclusion_mask = self.legitimate_detector.create_exclusion_mask(image.shape[:2], min_confidence=0.3)
@@ -893,45 +754,32 @@ class IntegratedTextureAnalyzer:
         exclusion_percentage = (excluded_pixels / total_pixels) * 100
         
         if self.debug:
-            print(f"  Elementos: {list(legitimate_elements.keys())}")
-            print(f"  Excluído: {exclusion_percentage:.1f}%")
+            print(f"FASE 1: Excluído: {exclusion_percentage:.1f}%")
         
-        # FASE 2: Análise de iluminação (V2.1)
         lighting_result = None
         lighting_score_penalty = 0
         
         if self.enable_lighting_analysis and self.lighting_analyzer:
-            if self.debug:
-                print("FASE 2: Análise de iluminação...")
-            
             try:
                 lighting_result = self.lighting_analyzer.analyze_lighting(image)
-                lighting_score_penalty = int(lighting_result.inconsistency_score * 25)  # Até -25 pontos
+                lighting_score_penalty = int(lighting_result.inconsistency_score * 25)
                 
                 if self.debug:
-                    print(f"  Inconsistência: {lighting_result.inconsistency_score:.2%}")
-                    print(f"  Penalidade: -{lighting_score_penalty} pontos")
+                    print(f"FASE 2: Luz penalty: -{lighting_score_penalty}")
             except Exception as e:
                 if self.debug:
-                    print(f"  Erro na análise de iluminação: {e}")
+                    print(f"Erro luz: {e}")
         
-        # FASE 3: NOVA - Análise de bordas (V2.2)
         edge_result = None
         edge_score_penalty = 0
         
         if self.enable_edge_analysis and self.edge_analyzer:
-            if self.debug:
-                print("FASE 3: Análise de bordas/contornos...")
-            
             try:
                 edge_result = self.edge_analyzer.analyze_edges(image)
-                
-                # Penalizar MUITO se bordas artificiais
-                # Score de artefato de borda alto = penalidade grande
                 edge_artifact = edge_result['edge_artifact_score']
                 
                 if edge_artifact > 0.6:
-                    edge_score_penalty = 35  # Penalidade ALTA
+                    edge_score_penalty = 35
                 elif edge_artifact > 0.4:
                     edge_score_penalty = 25
                 elif edge_artifact > 0.2:
@@ -940,23 +788,16 @@ class IntegratedTextureAnalyzer:
                     edge_score_penalty = 5
                 
                 if self.debug:
-                    print(f"  Artefatos de borda: {edge_artifact:.2%}")
-                    print(f"  Penalidade: -{edge_score_penalty} pontos")
+                    print(f"FASE 3: Edge penalty: -{edge_score_penalty}")
             except Exception as e:
                 if self.debug:
-                    print(f"  Erro na análise de bordas: {e}")
-        
-        # FASE 4: Análise de textura LBP (V1)
-        if self.debug:
-            print("FASE 4: Textura LBP (V1)...")
+                    print(f"Erro bordas: {e}")
         
         texture_results = self._analyze_texture_with_mask(image, exclusion_mask)
         
-        # Combinar score: textura base - penalidades
         base_score = texture_results['naturalness_score']
         final_score = max(0, base_score - lighting_score_penalty - edge_score_penalty)
         
-        # Resultados integrados
         integrated_results = {
             'v2_legitimate_elements': legitimate_elements,
             'v2_exclusion_mask': exclusion_mask,
@@ -973,17 +814,11 @@ class IntegratedTextureAnalyzer:
         }
         
         if self.debug:
-            print(f"\n  Score base (textura): {base_score}")
-            print(f"  Penalidade (luz): -{lighting_score_penalty}")
-            print(f"  Penalidade (bordas): -{edge_score_penalty}")
-            print(f"  Score final: {final_score}")
-            print(f"  Categoria: {integrated_results['final_category'][0]}")
-            print("=== ANÁLISE CONCLUÍDA ===\n")
+            print(f"Score final: {final_score}")
         
         return integrated_results
     
     def _analyze_texture_with_mask(self, image, exclusion_mask):
-        """Análise de textura LBP aplicando máscara de exclusão"""
         if len(image.shape) > 2:
             img_gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
         else:
@@ -1056,7 +891,6 @@ class IntegratedTextureAnalyzer:
         }
     
     def _classify_naturalness(self, score):
-        """Classificação do score"""
         if score <= 45:
             return "Alta chance de manipulação", "Textura artificial detectada"
         elif score <= 70:
@@ -1065,7 +899,6 @@ class IntegratedTextureAnalyzer:
             return "Textura natural", "Baixa chance de manipulação"
     
     def generate_visual_report(self, image, integrated_results):
-        """Gera relatório visual integrado V2.2"""
         if len(image.shape) == 2:
             image = cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
         elif image.shape[2] == 4:
@@ -1087,7 +920,6 @@ class IntegratedTextureAnalyzer:
         
         highlighted = overlay.copy()
         
-        # Áreas suspeitas de textura (roxo)
         contours, _ = cv2.findContours(suspicious_mask_resized, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         for contour in contours:
             area = cv2.contourArea(contour)
@@ -1095,7 +927,6 @@ class IntegratedTextureAnalyzer:
                 x, y, w, h = cv2.boundingRect(contour)
                 cv2.rectangle(highlighted, (x, y), (x+w, y+h), (128, 0, 128), 2)
         
-        # Áreas excluídas (verde)
         contours_excluded, _ = cv2.findContours(exclusion_mask_resized, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         for contour in contours_excluded:
             area = cv2.contourArea(contour)
@@ -1103,26 +934,22 @@ class IntegratedTextureAnalyzer:
                 x, y, w, h = cv2.boundingRect(contour)
                 cv2.rectangle(highlighted, (x, y), (x+w, y+h), (0, 255, 0), 2)
         
-        # Inconsistências de iluminação (laranja)
         lighting_analysis = integrated_results.get('v2_1_lighting_analysis')
         if lighting_analysis and lighting_analysis['suspicious_regions_count'] > 0:
             for x, y, w, h in lighting_analysis['suspicious_regions']:
                 cv2.rectangle(highlighted, (x, y), (x+w, y+h), (0, 165, 255), 2)
         
-        # NOVO: Bordas artificiais (ciano)
         edge_analysis = integrated_results.get('v2_2_edge_analysis')
-        if edge_analysis:
+        if edge_analysis and edge_analysis['artificial_edge_mask'] is not None:
             artificial_edge_mask = edge_analysis['artificial_edge_mask']
-            if artificial_edge_mask is not None:
-                artificial_resized = cv2.resize(artificial_edge_mask, (width, height), interpolation=cv2.INTER_NEAREST)
-                
-                # Destacar áreas com bordas artificiais
-                edge_contours, _ = cv2.findContours(artificial_resized, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                for contour in edge_contours:
-                    area = cv2.contourArea(contour)
-                    if area > 200:
-                        x, y, w, h = cv2.boundingRect(contour)
-                        cv2.rectangle(highlighted, (x, y), (x+w, y+h), (255, 255, 0), 2)  # Ciano
+            artificial_resized = cv2.resize(artificial_edge_mask, (width, height), interpolation=cv2.INTER_NEAREST)
+            
+            edge_contours, _ = cv2.findContours(artificial_resized, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            for contour in edge_contours:
+                area = cv2.contourArea(contour)
+                if area > 200:
+                    x, y, w, h = cv2.boundingRect(contour)
+                    cv2.rectangle(highlighted, (x, y), (x+w, y+h), (255, 255, 0), 2)
         
         category, _ = integrated_results['final_category']
         
@@ -1139,39 +966,15 @@ class IntegratedTextureAnalyzer:
                    (10, y_offset), font, 0.6, (0, 255, 0), 2)
         y_offset += 30
         
-        # Penalidade de iluminação
         lighting_penalty = integrated_results.get('v2_1_lighting_score_penalty', 0)
         if lighting_penalty > 0:
             cv2.putText(highlighted, f"Luz: -{lighting_penalty}pts", 
                        (10, y_offset), font, 0.6, (0, 165, 255), 2)
             y_offset += 30
         
-        # NOVO: Penalidade de bordas
         edge_penalty = integrated_results.get('v2_2_edge_score_penalty', 0)
         if edge_penalty > 0:
             cv2.putText(highlighted, f"Bordas: -{edge_penalty}pts", 
                        (10, y_offset), font, 0.6, (255, 255, 0), 2)
-        
-        return highlighted, heatmap), (x+w, y+h), (0, 255, 0), 2)
-        
-        # NOVO: Marcar inconsistências de iluminação (laranja)
-        lighting_analysis = integrated_results.get('v2_1_lighting_analysis')
-        if lighting_analysis and lighting_analysis['suspicious_regions_count'] > 0:
-            for x, y, w, h in lighting_analysis['suspicious_regions']:
-                cv2.rectangle(highlighted, (x, y), (x+w, y+h), (0, 165, 255), 2)  # Laranja
-        
-        category, _ = integrated_results['final_category']
-        
-        font = cv2.FONT_HERSHEY_SIMPLEX
-        cv2.putText(highlighted, f"Score: {score}/100", (10, 30), font, 0.7, (255, 255, 255), 2)
-        cv2.putText(highlighted, category, (10, 60), font, 0.7, (255, 255, 255), 2)
-        cv2.putText(highlighted, f"Excluido: {integrated_results['v2_exclusion_percentage']:.1f}%", 
-                   (10, 90), font, 0.6, (0, 255, 0), 2)
-        
-        # NOVO: Mostrar penalidade de iluminação
-        lighting_penalty = integrated_results.get('v2_1_lighting_score_penalty', 0)
-        if lighting_penalty > 0:
-            cv2.putText(highlighted, f"Luz: -{lighting_penalty}pts", 
-                       (10, 120), font, 0.6, (0, 165, 255), 2)
         
         return highlighted, heatmap
