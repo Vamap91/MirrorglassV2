@@ -1,414 +1,490 @@
-# streamlit_app.py
+# integrated_analyzer.py
 """
-MirrorGlass V2 - Sistema Integrado de Detecção de Fraudes por IA
-Mantém UX da V1 + adiciona análise inteligente com filtro V2
+MirrorGlass V2 - Analisador Integrado
+Combina detecção de elementos legítimos (V2) + análise de textura (V1)
 """
 
-import streamlit as st
-import numpy as np
-from PIL import Image
 import cv2
-import time
-import json
-import base64
-import io
-from integrated_analyzer import IntegratedTextureAnalyzer
+import numpy as np
+from typing import Dict, Tuple, Optional
+import pytesseract
+from dataclasses import dataclass, field
+from skimage.feature import local_binary_pattern
+from scipy.stats import entropy
 
-# Configuração da página
-st.set_page_config(
-    page_title="MirrorGlass V2 - Detecção de Fraudes por IA",
-    page_icon="🔍",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
 
-# Título e introdução
-st.title("📊 MirrorGlass V2: Detecção de Fraudes por IA em Imagens Automotivas")
-st.markdown("""
-Este sistema utiliza técnicas avançadas de visão computacional para detectar manipulações por IA em imagens automotivas.
+@dataclass
+class RegionInfo:
+    """Informações sobre uma região detectada"""
+    mask: np.ndarray
+    confidence: float
+    type: str
+    bbox: Tuple[int, int, int, int]
+    metadata: Dict = None
 
-### ✨ Novidade V2:
-- **Filtro inteligente** que elimina falsos positivos causados por textos, papéis e reflexos
-- **Análise focada** apenas nas áreas relevantes do veículo
-- **Precisão aumentada** em até 90%
 
-### Como funciona?
-1. **Fase 1 (V2)**: Detecta e exclui elementos legítimos (textos, papéis, reflexos)
-2. **Fase 2 (V1)**: Analisa textura LBP apenas nas áreas relevantes
-3. Resultado: Score preciso de naturalidade da imagem
-""")
-
-# Barra lateral
-st.sidebar.header("⚙️ Configurações")
-
-# Configurações de análise
-st.sidebar.subheader("Análise de Textura")
-
-limiar_naturalidade = st.sidebar.slider(
-    "Limiar de Naturalidade", 
-    min_value=30, 
-    max_value=80, 
-    value=50, 
-    help="Score abaixo deste valor indica possível manipulação por IA"
-)
-
-tamanho_bloco = st.sidebar.slider(
-    "Tamanho do Bloco", 
-    min_value=8, 
-    max_value=32, 
-    value=20, 
-    step=4,
-    help="Tamanho do bloco para análise de textura (menor = mais sensível)"
-)
-
-threshold_lbp = st.sidebar.slider(
-    "Sensibilidade LBP", 
-    min_value=0.1, 
-    max_value=0.5, 
-    value=0.50, 
-    step=0.05,
-    help="Limiar para detecção de áreas suspeitas (menor = mais sensível)"
-)
-
-debug_mode = st.sidebar.checkbox(
-    "🐛 Modo Debug",
-    value=False,
-    help="Mostra informações detalhadas no console"
-)
-
-# Informações na sidebar
-st.sidebar.markdown("---")
-st.sidebar.info("""
-**Desenvolvido para:** MirrorGlass  
-**Projeto:** Detecção de Fraudes em Imagens Automotivas  
-**Versão:** 2.0.0 (Integrado)  
-**Método:** V2 (Filtro) + V1 (LBP)
-""")
-
-# Função auxiliar para download
-def get_image_download_link(img, filename, text):
-    if isinstance(img, np.ndarray):
-        img_pil = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
-    else:
-        img_pil = img
-        
-    buf = io.BytesIO()
-    img_pil.save(buf, format='JPEG')
-    buf.seek(0)
+class LegitimateElementDetector:
+    """Detecta elementos legítimos (texto, papel, reflexos)"""
     
-    img_str = base64.b64encode(buf.read()).decode()
-    href = f'<a href="data:image/jpeg;base64,{img_str}" download="{filename}">{text}</a>'
+    def __init__(self, debug=False):
+        self.debug = debug
+        self.detection_results = {}
+        
+    def detect_all(self, image: np.ndarray) -> Dict[str, RegionInfo]:
+        """Detecta todos os elementos legítimos"""
+        if image is None or image.size == 0:
+            raise ValueError("Imagem inválida")
+            
+        results = {}
+        
+        # 1. Detectar textos e etiquetas
+        try:
+            text_regions = self._detect_text_regions(image)
+            if text_regions:
+                results['text'] = text_regions
+        except Exception as e:
+            if self.debug:
+                print(f"Erro na detecção de texto: {e}")
+            
+        # 2. Detectar papéis uniformes
+        try:
+            paper_regions = self._detect_paper_regions(image)
+            if paper_regions:
+                results['paper'] = paper_regions
+        except Exception as e:
+            if self.debug:
+                print(f"Erro na detecção de papel: {e}")
+            
+        # 3. Detectar reflexos de vidro
+        try:
+            reflection_regions = self._detect_glass_reflections(image)
+            if reflection_regions:
+                results['reflections'] = reflection_regions
+        except Exception as e:
+            if self.debug:
+                print(f"Erro na detecção de reflexos: {e}")
+        
+        self.detection_results = results
+        return results
     
-    return href
-
-# Interface principal
-st.markdown("### 🔹 Passo 1: Carregar Imagens")
-uploaded_files = st.file_uploader(
-    "Faça upload das imagens para análise", 
-    accept_multiple_files=True,
-    type=['jpg', 'jpeg', 'png']
-)
-
-if uploaded_files:
-    st.write(f"✅ {len(uploaded_files)} imagens carregadas")
-    
-    if st.button("🚀 Iniciar Análise Integrada", key="iniciar_analise"):
-        # Carregar imagens
-        imagens = []
-        nomes = []
+    def _detect_text_regions(self, image: np.ndarray) -> Optional[RegionInfo]:
+        """Detecta regiões com texto"""
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        h, w = gray.shape
+        text_mask = np.zeros((h, w), dtype=np.uint8)
         
-        for arquivo in uploaded_files:
-            try:
-                img = Image.open(arquivo).convert('RGB')
-                imagens.append(np.array(img))
-                nomes.append(arquivo.name)
-            except Exception as e:
-                st.error(f"Erro ao abrir a imagem {arquivo.name}: {e}")
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+        enhanced = clahe.apply(gray)
         
-        # Criar analisador integrado
-        analyzer = IntegratedTextureAnalyzer(
-            P=8,
-            R=1,
-            block_size=tamanho_bloco,
-            threshold=threshold_lbp,
-            debug=debug_mode
-        )
-        
-        # Processar cada imagem
-        progress_bar = st.progress(0)
-        status_text = st.empty()
-        
-        resultados = []
-        
-        for i, (img, nome) in enumerate(zip(imagens, nomes)):
-            progress = (i + 1) / len(imagens)
-            progress_bar.progress(progress)
-            status_text.text(f"Analisando imagem {i+1} de {len(imagens)}: {nome}")
+        try:
+            data = pytesseract.image_to_data(enhanced, output_type=pytesseract.Output.DICT, config='--psm 11')
             
-            try:
-                # Análise integrada (V2 + V1)
-                integrated_results = analyzer.analyze_image_integrated(img)
-                
-                # Gerar visualização
-                visual_report, heatmap = analyzer.generate_visual_report(img, integrated_results)
-                
-                # Armazenar resultados
-                resultados.append({
-                    'nome': nome,
-                    'imagem_original': img,
-                    'integrated_results': integrated_results,
-                    'visual_report': visual_report,
-                    'heatmap': heatmap
-                })
-                
-            except Exception as e:
-                st.error(f"Erro ao analisar {nome}: {str(e)}")
-                if debug_mode:
-                    st.exception(e)
-        
-        progress_bar.empty()
-        status_text.text("✅ Análise concluída!")
-        
-        # Exibir resultados
-        st.markdown("## 🤖 Resultados da Análise Integrada")
-        
-        for res in resultados:
-            st.write("---")
-            st.subheader(f"📸 {res['nome']}")
+            valid_text_count = 0
+            total_conf = 0
+            detected_texts = []
             
-            ir = res['integrated_results']
-            
-            # Layout principal
-            col1, col2 = st.columns(2)
-            
-            with col1:
-                st.image(res['visual_report'], caption=f"Análise Integrada - {res['nome']}", use_column_width=True)
-                
-                # Métricas principais
-                score = ir['final_score']
-                category, description = ir['final_category']
-                
-                st.metric("Score de Naturalidade", score)
-                
-                if score <= 45:
-                    st.error(f"⚠️ {category}: {description}")
-                elif score <= 70:
-                    st.warning(f"⚠️ {category}: {description}")
-                else:
-                    st.success(f"✅ {category}: {description}")
-                
-                # Download
-                st.markdown(
-                    get_image_download_link(
-                        res['visual_report'], 
-                        f"analise_{res['nome'].replace(' ', '_')}.jpg",
-                        "📥 Baixar Imagem Analisada"
-                    ),
-                    unsafe_allow_html=True
-                )
-            
-            with col2:
-                st.image(res['heatmap'], caption="Mapa de Calor LBP", use_column_width=True)
-                
-                st.write("### 📊 Detalhes da Análise Integrada")
-                
-                # Informações V2 (Filtro)
-                st.write("**Fase 1 - Filtro V2 (Elementos Legítimos):**")
-                exclusion_pct = ir['v2_exclusion_percentage']
-                
-                if exclusion_pct > 40:
-                    st.info(f"🟢 Área excluída: {exclusion_pct:.1f}% (texto/papel/reflexo)")
-                elif exclusion_pct > 10:
-                    st.info(f"🟡 Área excluída: {exclusion_pct:.1f}%")
-                else:
-                    st.info(f"⚪ Área excluída: {exclusion_pct:.1f}%")
-                
-                # Elementos detectados
-                legitimate_elements = ir['v2_legitimate_elements']
-                if legitimate_elements:
-                    detected_types = list(legitimate_elements.keys())
-                    st.write(f"- Elementos detectados: {', '.join(detected_types)}")
-                else:
-                    st.write("- Nenhum elemento legítimo detectado")
-                
-                # Informações V1 (Análise)
-                st.write("**Fase 2 - Análise V1 (Textura LBP):**")
-                suspicious_pct = ir['suspicious_areas_percentage']
-                
-                if suspicious_pct > 60:
-                    st.error(f"🚨 Áreas suspeitas: {suspicious_pct:.2f}% - ALTO RISCO!")
-                elif suspicious_pct > 30:
-                    st.warning(f"⚠️ Áreas suspeitas: {suspicious_pct:.2f}% - ATENÇÃO!")
-                else:
-                    st.write(f"- Áreas suspeitas: {suspicious_pct:.2f}%")
-                
-                st.write(f"- Interpretação: {description}")
-                
-                # Legenda
-                st.write("**Legenda:**")
-                st.write("- 🟢 Verde: Áreas excluídas (texto/papel/reflexo)")
-                st.write("- 🟣 Roxo: Áreas suspeitas de manipulação")
-                st.write("- Azul (mapa): Texturas naturais")
-                st.write("- Vermelho (mapa): Texturas artificiais")
-            
-            # Detalhes expandíveis
-            with st.expander("🔍 Ver Análise Detalhada"):
-                col_det1, col_det2 = st.columns(2)
-                
-                with col_det1:
-                    st.write("#### Elementos Legítimos Detectados (V2)")
+            for i, conf in enumerate(data['conf']):
+                if int(conf) > 30:
+                    text = str(data['text'][i]).strip()
                     
-                    if not legitimate_elements:
-                        st.info("Nenhum elemento legítimo detectado")
-                    else:
-                        for elem_type, elem_info in legitimate_elements.items():
-                            st.write(f"**{elem_type.upper()}**")
-                            st.write(f"- Confiança: {elem_info.confidence:.0%}")
-                            st.write(f"- BBox: {elem_info.bbox}")
+                    if len(text) >= 2:
+                        alnum_count = sum(c.isalnum() for c in text)
+                        if alnum_count >= 2:
+                            x, y = int(data['left'][i]), int(data['top'][i])
+                            w_box, h_box = int(data['width'][i]), int(data['height'][i])
                             
-                            if elem_info.metadata:
-                                if elem_type == 'text' and 'texts' in elem_info.metadata:
-                                    texts = elem_info.metadata['texts']
-                                    if texts:
-                                        st.write(f"- Textos: {', '.join(texts)}")
+                            if w_box > 0 and h_box > 0:
+                                padding = 10
+                                x1 = max(0, x - padding)
+                                y1 = max(0, y - padding)
+                                x2 = min(w, x + w_box + padding)
+                                y2 = min(h, y + h_box + padding)
                                 
-                                if elem_type == 'paper' and 'paper_count' in elem_info.metadata:
-                                    st.write(f"- Papéis: {elem_info.metadata['paper_count']}")
+                                text_mask[y1:y2, x1:x2] = 255
                                 
-                                if elem_type == 'reflection' and 'reflection_percentage' in elem_info.metadata:
-                                    st.write(f"- Cobertura: {elem_info.metadata['reflection_percentage']:.1f}%")
-                            st.write("")
+                                valid_text_count += 1
+                                total_conf += int(conf)
+                                detected_texts.append(text)
+            
+            if valid_text_count > 0:
+                avg_conf = total_conf / valid_text_count
                 
-                with col_det2:
-                    st.write("#### Análise de Textura (V1)")
-                    texture_analysis = ir['v1_texture_analysis']
-                    
-                    st.write(f"- Score de naturalidade: {ir['final_score']}")
-                    st.write(f"- Áreas suspeitas: {suspicious_pct:.2f}%")
-                    st.write(f"- Blocos analisados: Apenas áreas não excluídas")
-                    st.write(f"- Método: LBP (Local Binary Pattern)")
-                    
-                    st.write("\n**Comparação V1 vs V2:**")
-                    st.write("- ✅ V2 eliminou falsos positivos")
-                    st.write("- ✅ Análise focada em áreas relevantes")
-                    st.write("- ✅ Precisão aumentada")
-        
-        # Relatório consolidado
-        st.markdown("---")
-        st.markdown("### 📋 Resumo Geral")
-        
-        if resultados:
-            # Estatísticas
-            scores = [r['integrated_results']['final_score'] for r in resultados]
-            manipuladas = sum(1 for s in scores if s <= 45)
-            suspeitas = sum(1 for s in scores if 45 < s <= 70)
-            naturais = sum(1 for s in scores if s > 70)
-            
-            col_stat1, col_stat2, col_stat3, col_stat4 = st.columns(4)
-            
-            with col_stat1:
-                st.metric("Total Analisadas", len(resultados))
-            
-            with col_stat2:
-                st.metric("Manipuladas (IA)", manipuladas)
-            
-            with col_stat3:
-                st.metric("Suspeitas", suspeitas)
-            
-            with col_stat4:
-                st.metric("Naturais", naturais)
-            
-            # Tabela resumida
-            import pandas as pd
-            
-            df_resumo = pd.DataFrame([
-                {
-                    'Arquivo': r['nome'],
-                    'Score': r['integrated_results']['final_score'],
-                    'Categoria': r['integrated_results']['final_category'][0],
-                    'Área Excluída (%)': round(r['integrated_results']['v2_exclusion_percentage'], 1),
-                    'Áreas Suspeitas (%)': round(r['integrated_results']['suspicious_areas_percentage'], 1)
-                }
-                for r in resultados
-            ])
-            
-            st.dataframe(df_resumo)
-            
-            # JSON resumido
-            with st.expander("📄 Ver JSON Resumido"):
-                json_resumido = {
-                    "timestamp": time.strftime('%Y-%m-%d %H:%M:%S'),
-                    "versao": "2.0.0 (Integrado V2+V1)",
-                    "total_imagens": len(resultados),
-                    "estatisticas": {
-                        "manipuladas": manipuladas,
-                        "suspeitas": suspeitas,
-                        "naturais": naturais
-                    },
-                    "score_medio": round(np.mean(scores), 2),
-                    "resultados": [
-                        {
-                            "nome": r['nome'],
-                            "score": r['integrated_results']['final_score'],
-                            "categoria": r['integrated_results']['final_category'][0],
-                            "area_excluida_pct": round(r['integrated_results']['v2_exclusion_percentage'], 1),
-                            "areas_suspeitas_pct": round(r['integrated_results']['suspicious_areas_percentage'], 1),
-                            "elementos_detectados": list(r['integrated_results']['v2_legitimate_elements'].keys())
-                        }
-                        for r in resultados
-                    ]
-                }
+                kernel = np.ones((15, 15), np.uint8)
+                text_mask = cv2.dilate(text_mask, kernel, iterations=1)
                 
-                json_str = json.dumps(json_resumido, indent=2, ensure_ascii=False)
-                st.code(json_str, language='json')
+                contours, _ = cv2.findContours(text_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                if contours:
+                    x, y, w_c, h_c = cv2.boundingRect(np.vstack(contours))
+                    bbox = (int(x), int(y), int(w_c), int(h_c))
+                else:
+                    bbox = (0, 0, w, h)
                 
-                st.download_button(
-                    label="📥 Baixar JSON Resumido",
-                    data=json_str,
-                    file_name=f"mirrorglass_v2_resumo_{time.strftime('%Y%m%d_%H%M%S')}.json",
-                    mime="application/json"
+                return RegionInfo(
+                    mask=text_mask,
+                    confidence=min(avg_conf / 100.0, 1.0),
+                    type='text',
+                    bbox=bbox,
+                    metadata={'text_count': valid_text_count, 'texts': detected_texts[:10]}
                 )
-
-else:
-    st.info("📤 Faça upload de imagens para começar a análise.")
-
-# Rodapé com instruções
-st.markdown("---")
-st.markdown("### 📚 Como Interpretar os Resultados")
-
-col_help1, col_help2 = st.columns(2)
-
-with col_help1:
-    st.markdown("#### Score de Naturalidade")
-    st.write("""
-    - **0-45**: 🔴 Alta probabilidade de manipulação por IA
-    - **46-70**: 🟡 Textura suspeita, verificar manualmente
-    - **71-100**: 🟢 Textura natural, imagem legítima
-    """)
+        except Exception as e:
+            if self.debug:
+                print(f"Erro OCR: {e}")
+        
+        return None
     
-    st.markdown("#### Área Excluída (V2)")
-    st.write("""
-    - **< 10%**: Poucos elementos legítimos
-    - **10-40%**: Presença moderada (normal)
-    - **> 40%**: Muitos textos/papéis/reflexos
-    """)
+    def _detect_paper_regions(self, image: np.ndarray) -> Optional[RegionInfo]:
+        """Detecta papéis uniformes"""
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        h, w = gray.shape
+        paper_mask = np.zeros((h, w), dtype=np.uint8)
+        
+        kernel_size = 15
+        gray_float = gray.astype(np.float32)
+        
+        mean = cv2.blur(gray_float, (kernel_size, kernel_size))
+        mean_sq = cv2.blur(gray_float**2, (kernel_size, kernel_size))
+        variance = mean_sq - mean**2
+        variance = np.maximum(variance, 0)
+        std_dev = np.sqrt(variance)
+        
+        uniform_mask = (std_dev < 20).astype(np.uint8) * 255
+        edges = cv2.Canny(gray, 50, 150)
+        
+        kernel_edge = np.ones((3, 3), np.uint8)
+        edges = cv2.dilate(edges, kernel_edge, iterations=1)
+        
+        contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        valid_papers = []
+        
+        for contour in contours:
+            area = cv2.contourArea(contour)
+            
+            min_area = 5000
+            max_area = h * w * 0.6
+            
+            if area < min_area or area > max_area:
+                continue
+            
+            peri = cv2.arcLength(contour, True)
+            approx = cv2.approxPolyDP(contour, 0.04 * peri, True)
+            
+            if 4 <= len(approx) <= 6:
+                x, y, w_c, h_c = cv2.boundingRect(contour)
+                
+                aspect_ratio = float(w_c) / h_c if h_c > 0 else 0
+                if aspect_ratio < 0.3 or aspect_ratio > 3.0:
+                    continue
+                
+                roi_uniform = uniform_mask[y:y+h_c, x:x+w_c]
+                if roi_uniform.size == 0:
+                    continue
+                    
+                uniformity_ratio = np.sum(roi_uniform == 255) / roi_uniform.size
+                
+                if uniformity_ratio > 0.5:
+                    roi_color = gray[y:y+h_c, x:x+w_c]
+                    mean_brightness = np.mean(roi_color)
+                    
+                    if mean_brightness > 100:
+                        cv2.drawContours(paper_mask, [contour], -1, 255, -1)
+                        valid_papers.append({
+                            'bbox': (int(x), int(y), int(w_c), int(h_c)),
+                            'uniformity': float(uniformity_ratio),
+                            'brightness': float(mean_brightness),
+                            'area': float(area)
+                        })
+        
+        if valid_papers:
+            avg_uniformity = np.mean([p['uniformity'] for p in valid_papers])
+            
+            all_bboxes = [p['bbox'] for p in valid_papers]
+            x_min = min(b[0] for b in all_bboxes)
+            y_min = min(b[1] for b in all_bboxes)
+            x_max = max(b[0] + b[2] for b in all_bboxes)
+            y_max = max(b[1] + b[3] for b in all_bboxes)
+            
+            return RegionInfo(
+                mask=paper_mask,
+                confidence=float(avg_uniformity),
+                type='paper',
+                bbox=(int(x_min), int(y_min), int(x_max - x_min), int(y_max - y_min)),
+                metadata={'paper_count': len(valid_papers), 'papers': valid_papers}
+            )
+        
+        return None
+    
+    def _detect_glass_reflections(self, image: np.ndarray) -> Optional[RegionInfo]:
+        """Detecta reflexos em vidro"""
+        hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+        h, w = image.shape[:2]
+        
+        h_channel, s_channel, v_channel = cv2.split(hsv)
+        reflection_mask = np.zeros((h, w), dtype=np.uint8)
+        
+        low_saturation = s_channel < 50
+        high_value = v_channel > 200
+        
+        potential_reflections = (low_saturation & high_value).astype(np.uint8) * 255
+        
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        gray_float = gray.astype(np.float64)
+        
+        grad_x = cv2.Sobel(gray_float, cv2.CV_64F, 1, 0, ksize=5)
+        grad_y = cv2.Sobel(gray_float, cv2.CV_64F, 0, 1, ksize=5)
+        grad_mag = np.sqrt(grad_x**2 + grad_y**2)
+        
+        smooth_gradients = ((grad_mag > 10) & (grad_mag < 80)).astype(np.uint8) * 255
+        
+        reflection_mask = cv2.bitwise_and(potential_reflections, smooth_gradients)
+        
+        kernel = np.ones((5, 5), np.uint8)
+        reflection_mask = cv2.morphologyEx(reflection_mask, cv2.MORPH_OPEN, kernel)
+        reflection_mask = cv2.morphologyEx(reflection_mask, cv2.MORPH_CLOSE, kernel)
+        
+        reflection_area = np.sum(reflection_mask == 255)
+        total_area = h * w
+        reflection_ratio = reflection_area / total_area
+        
+        if reflection_ratio > 0.05:
+            contours, _ = cv2.findContours(reflection_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            if contours:
+                x, y, w_c, h_c = cv2.boundingRect(np.vstack(contours))
+                bbox = (int(x), int(y), int(w_c), int(h_c))
+            else:
+                bbox = (0, 0, w, h)
+            
+            return RegionInfo(
+                mask=reflection_mask,
+                confidence=min(float(reflection_ratio * 5), 1.0),
+                type='reflection',
+                bbox=bbox,
+                metadata={'reflection_percentage': float(reflection_ratio * 100)}
+            )
+        
+        return None
+    
+    def create_exclusion_mask(self, image_shape: Tuple[int, int], min_confidence: float = 0.3) -> np.ndarray:
+        """Cria máscara de exclusão"""
+        h, w = image_shape
+        exclusion_mask = np.zeros((h, w), dtype=np.uint8)
+        
+        for region_type, region_info in self.detection_results.items():
+            if region_info and region_info.confidence >= min_confidence:
+                exclusion_mask = cv2.bitwise_or(exclusion_mask, region_info.mask)
+        
+        return exclusion_mask
 
-with col_help2:
-    st.markdown("#### Novidade V2")
-    st.write("""
-    **Problema V1:** Etiquetas e papéis causavam falsos positivos
+
+class IntegratedTextureAnalyzer:
+    """
+    Analisador de textura integrado com detecção de elementos legítimos
+    Combina V2 (filtro) + V1 (análise LBP)
+    """
     
-    **Solução V2:** 
-    1. Detecta textos, papéis e reflexos
-    2. Exclui essas áreas da análise
-    3. Analisa APENAS áreas do veículo
+    def __init__(self, P=8, R=1, block_size=20, threshold=0.50, debug=False):
+        self.P = P
+        self.R = R
+        self.block_size = block_size
+        self.threshold = threshold
+        self.debug = debug
+        self.legitimate_detector = LegitimateElementDetector(debug=debug)
     
-    **Resultado:** Score preciso, sem falsos positivos!
-    """)
+    def analyze_image_integrated(self, image):
+        """
+        Análise integrada: V2 (filtro) → V1 (análise de textura)
+        """
+        if self.debug:
+            print("\n=== INICIANDO ANÁLISE INTEGRADA ===")
+        
+        # FASE 1: Detectar elementos legítimos (V2)
+        if self.debug:
+            print("FASE 1: Detectando elementos legítimos (V2)...")
+        
+        legitimate_elements = self.legitimate_detector.detect_all(image)
+        exclusion_mask = self.legitimate_detector.create_exclusion_mask(image.shape[:2], min_confidence=0.3)
+        
+        # Estatísticas da exclusão
+        h, w = image.shape[:2]
+        total_pixels = h * w
+        excluded_pixels = np.sum(exclusion_mask == 255)
+        exclusion_percentage = (excluded_pixels / total_pixels) * 100
+        
+        if self.debug:
+            print(f"  Elementos detectados: {list(legitimate_elements.keys())}")
+            print(f"  Área excluída: {exclusion_percentage:.1f}%")
+        
+        # FASE 2: Análise de textura LBP apenas nas áreas NÃO excluídas (V1)
+        if self.debug:
+            print("FASE 2: Analisando textura (V1) nas áreas não excluídas...")
+        
+        texture_results = self._analyze_texture_with_mask(image, exclusion_mask)
+        
+        # Combinar resultados
+        integrated_results = {
+            'v2_legitimate_elements': legitimate_elements,
+            'v2_exclusion_mask': exclusion_mask,
+            'v2_exclusion_percentage': exclusion_percentage,
+            'v1_texture_analysis': texture_results,
+            'final_score': texture_results['naturalness_score'],
+            'final_category': self._classify_naturalness(texture_results['naturalness_score']),
+            'suspicious_areas_percentage': texture_results.get('suspicious_percentage', 0)
+        }
+        
+        if self.debug:
+            print(f"  Score final: {integrated_results['final_score']}")
+            print(f"  Categoria: {integrated_results['final_category'][0]}")
+            print("=== ANÁLISE CONCLUÍDA ===\n")
+        
+        return integrated_results
     
-    st.markdown("#### Legendas Visuais")
-    st.write("""
-    - 🟢 **Retângulos verdes**: Áreas excluídas (legítimas)
-    - 🟣 **Retângulos roxos**: Áreas suspeitas de IA
-    - **Mapa de calor**: Vermelho = artificial, Azul = natural
-    """)
+    def _analyze_texture_with_mask(self, image, exclusion_mask):
+        """Análise de textura LBP aplicando máscara de exclusão"""
+        # Converter para escala de cinza
+        if len(image.shape) > 2:
+            img_gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+        else:
+            img_gray = image.copy()
+        
+        # Calcular LBP
+        lbp_image = local_binary_pattern(img_gray, self.P, self.R, method="uniform")
+        
+        # Análise em blocos
+        height, width = img_gray.shape
+        rows = max(1, height // self.block_size)
+        cols = max(1, width // self.block_size)
+        
+        # Redimensionar máscara de exclusão para tamanho dos blocos
+        exclusion_mask_resized = cv2.resize(exclusion_mask, (width, height))
+        
+        variance_map = np.zeros((rows, cols))
+        entropy_map = np.zeros((rows, cols))
+        exclusion_map = np.zeros((rows, cols))  # Marca blocos excluídos
+        
+        for i in range(0, height - self.block_size + 1, self.block_size):
+            for j in range(0, width - self.block_size + 1, self.block_size):
+                block_lbp = lbp_image[i:i+self.block_size, j:j+self.block_size]
+                block_mask = exclusion_mask_resized[i:i+self.block_size, j:j+self.block_size]
+                
+                row_idx = i // self.block_size
+                col_idx = j // self.block_size
+                
+                # Verificar se bloco está em área excluída (mais de 50% excluído)
+                exclusion_ratio = np.sum(block_mask == 255) / (self.block_size * self.block_size)
+                
+                if exclusion_ratio > 0.5:
+                    # Bloco excluído - marcar mas não analisar
+                    exclusion_map[row_idx, col_idx] = 1
+                    variance_map[row_idx, col_idx] = 1.0  # Valor neutro (alta naturalidade)
+                    entropy_map[row_idx, col_idx] = 1.0  # Valor neutro
+                else:
+                    # Bloco válido - analisar normalmente
+                    hist, _ = np.histogram(block_lbp, bins=10, range=(0, 10))
+                    hist = hist.astype("float")
+                    hist /= (hist.sum() + 1e-7)
+                    block_entropy = entropy(hist)
+                    max_entropy = np.log(10)
+                    norm_entropy = block_entropy / max_entropy if max_entropy > 0 else 0
+                    
+                    block_variance = np.var(block_lbp) / 255.0
+                    
+                    if row_idx < rows and col_idx < cols:
+                        variance_map[row_idx, col_idx] = block_variance
+                        entropy_map[row_idx, col_idx] = norm_entropy
+        
+        # Calcular mapa de naturalidade (70% entropia, 30% variância)
+        naturalness_map = entropy_map * 0.7 + variance_map * 0.3
+        
+        # Normalizar
+        norm_naturalness_map = cv2.normalize(naturalness_map, None, 0, 1, cv2.NORM_MINMAX)
+        
+        # Máscara de áreas suspeitas (APENAS em áreas não excluídas)
+        suspicious_mask = (norm_naturalness_map < self.threshold) & (exclusion_map == 0)
+        
+        # Calcular score APENAS considerando áreas não excluídas
+        valid_blocks = exclusion_map == 0
+        if np.sum(valid_blocks) > 0:
+            naturalness_score = int(np.mean(norm_naturalness_map[valid_blocks]) * 100)
+            suspicious_percentage = float(np.sum(suspicious_mask) / np.sum(valid_blocks) * 100)
+        else:
+            naturalness_score = 100  # Se tudo foi excluído, considerar natural
+            suspicious_percentage = 0.0
+        
+        # Criar heatmap
+        heatmap = cv2.applyColorMap((norm_naturalness_map * 255).astype(np.uint8), cv2.COLORMAP_JET)
+        
+        return {
+            'naturalness_map': norm_naturalness_map,
+            'suspicious_mask': suspicious_mask,
+            'exclusion_map': exclusion_map,
+            'naturalness_score': naturalness_score,
+            'suspicious_percentage': suspicious_percentage,
+            'heatmap': heatmap,
+            'entropy_map': entropy_map,
+            'variance_map': variance_map
+        }
+    
+    def _classify_naturalness(self, score):
+        """Classificação do score"""
+        if score <= 45:
+            return "Alta chance de manipulação", "Textura artificial detectada"
+        elif score <= 70:
+            return "Textura suspeita", "Revisão manual sugerida"
+        else:
+            return "Textura natural", "Baixa chance de manipulação"
+    
+    def generate_visual_report(self, image, integrated_results):
+        """Gera relatório visual integrado"""
+        if len(image.shape) == 2:
+            image = cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
+        elif image.shape[2] == 4:
+            image = cv2.cvtColor(image, cv2.COLOR_RGBA2RGB)
+        
+        height, width = image.shape[:2]
+        
+        # Extrair dados
+        naturalness_map = integrated_results['v1_texture_analysis']['naturalness_map']
+        suspicious_mask = integrated_results['v1_texture_analysis']['suspicious_mask']
+        exclusion_mask = integrated_results['v2_exclusion_mask']
+        score = integrated_results['final_score']
+        
+        # Redimensionar mapas
+        naturalness_map_resized = cv2.resize(naturalness_map, (width, height), interpolation=cv2.INTER_LINEAR)
+        suspicious_mask_resized = cv2.resize(suspicious_mask.astype(np.uint8), (width, height), interpolation=cv2.INTER_NEAREST)
+        exclusion_mask_resized = cv2.resize(exclusion_mask, (width, height), interpolation=cv2.INTER_NEAREST)
+        
+        # Criar heatmap
+        heatmap = cv2.applyColorMap((naturalness_map_resized * 255).astype(np.uint8), cv2.COLORMAP_JET)
+        
+        # Overlay
+        overlay = cv2.addWeighted(image, 0.6, heatmap, 0.4, 0)
+        
+        # Destacar áreas suspeitas (roxo)
+        highlighted = overlay.copy()
+        contours, _ = cv2.findContours(suspicious_mask_resized, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        for contour in contours:
+            area = cv2.contourArea(contour)
+            if area > 50:
+                x, y, w, h = cv2.boundingRect(contour)
+                cv2.rectangle(highlighted, (x, y), (x+w, y+h), (128, 0, 128), 2)
+        
+        # Destacar áreas excluídas (verde)
+        contours_excluded, _ = cv2.findContours(exclusion_mask_resized, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        for contour in contours_excluded:
+            area = cv2.contourArea(contour)
+            if area > 100:
+                x, y, w, h = cv2.boundingRect(contour)
+                cv2.rectangle(highlighted, (x, y), (x+w, y+h), (0, 255, 0), 2)
+        
+        # Adicionar texto
+        category, _ = integrated_results['final_category']
+        
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        cv2.putText(highlighted, f"Score: {score}/100", (10, 30), font, 0.7, (255, 255, 255), 2)
+        cv2.putText(highlighted, category, (10, 60), font, 0.7, (255, 255, 255), 2)
+        cv2.putText(highlighted, f"Excluido: {integrated_results['v2_exclusion_percentage']:.1f}%", 
+                   (10, 90), font, 0.6, (0, 255, 0), 2)
+        
+        return highlighted, heatmap
