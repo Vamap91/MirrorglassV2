@@ -1,6 +1,6 @@
 # integrated_analyzer.py
 """
-MirrorGlass V2.5 - CALIBRADO
+MirrorGlass V2.5 - ABORDAGEM CIENTÍFICA
 Baseado em papers validados com PENALIDADES AJUSTADAS
 """
 
@@ -25,9 +25,7 @@ class RegionInfo:
 
 
 class JPEGArtifactAnalyzer:
-    """
-    Detector 1: Análise de Artefatos JPEG (CALIBRADO)
-    """
+    """Detector 1: Análise de Artefatos JPEG"""
     
     def __init__(self, debug=False):
         self.debug = debug
@@ -37,16 +35,10 @@ class JPEGArtifactAnalyzer:
         if self.debug:
             print("\n--- Análise de Artefatos JPEG ---")
         
-        # 1. Análise de blocos DCT 8x8
         dct_inconsistency = self._analyze_dct_blocks(image)
-        
-        # 2. Análise de quantização
         quantization_anomaly = self._analyze_quantization_patterns(image)
-        
-        # 3. Análise de double JPEG
         double_jpeg_score = self._detect_double_jpeg(image)
         
-        # Score combinado
         jpeg_artifact_score = (
             dct_inconsistency * 0.4 +
             quantization_anomaly * 0.35 +
@@ -93,17 +85,14 @@ class JPEGArtifactAnalyzer:
                     if mean_variance > 0:
                         cv_variance = variance_of_variance / (mean_variance + 1e-7)
                         
-                        # CALIBRADO: Menos agressivo
-                        if cv_variance < 0.05:
-                            inconsistency_scores.append(0.9)
-                        elif cv_variance < 0.08:
-                            inconsistency_scores.append(0.7)
-                        elif cv_variance < 0.12:
-                            inconsistency_scores.append(0.5)
-                        elif cv_variance < 0.20:
-                            inconsistency_scores.append(0.3)
+                        if cv_variance < 0.1:
+                            inconsistency_scores.append(0.8)
+                        elif cv_variance < 0.2:
+                            inconsistency_scores.append(0.6)
+                        elif cv_variance < 0.3:
+                            inconsistency_scores.append(0.4)
                         else:
-                            inconsistency_scores.append(0.1)
+                            inconsistency_scores.append(0.2)
         
         return np.mean(inconsistency_scores) if inconsistency_scores else 0.0
     
@@ -124,17 +113,14 @@ class JPEGArtifactAnalyzer:
         if len(peaks) > 0:
             peak_strength = np.mean(peaks) / (np.mean(power_spectrum) + 1e-7)
             
-            # CALIBRADO: Threshold muito mais alto
-            if peak_strength > 10:
-                return 0.9
-            elif peak_strength > 7:
-                return 0.7
-            elif peak_strength > 5:
-                return 0.5
+            if peak_strength > 5:
+                return 0.8
             elif peak_strength > 3:
-                return 0.3
+                return 0.6
+            elif peak_strength > 2:
+                return 0.4
             else:
-                return 0.1
+                return 0.2
         
         return 0.0
     
@@ -158,8 +144,7 @@ class JPEGArtifactAnalyzer:
                         if hist[k-1] > 0 and hist[k+1] > 0:
                             valleys += 1
                 
-                # CALIBRADO: Threshold mais alto
-                if valleys > 8:
+                if valleys > 5:
                     double_jpeg_indicators.append(1)
                 else:
                     double_jpeg_indicators.append(0)
@@ -167,25 +152,20 @@ class JPEGArtifactAnalyzer:
         if double_jpeg_indicators:
             double_jpeg_ratio = np.mean(double_jpeg_indicators)
             
-            # CALIBRADO: Menos sensível
-            if double_jpeg_ratio > 0.5:
-                return 0.9
-            elif double_jpeg_ratio > 0.4:
-                return 0.7
-            elif double_jpeg_ratio > 0.3:
-                return 0.5
+            if double_jpeg_ratio > 0.3:
+                return 0.8
             elif double_jpeg_ratio > 0.2:
-                return 0.3
+                return 0.6
+            elif double_jpeg_ratio > 0.1:
+                return 0.4
             else:
-                return 0.1
+                return 0.2
         
         return 0.0
 
 
 class CopyMoveDetector:
-    """
-    Detector 2: Detecção de Copy-Move (CALIBRADO)
-    """
+    """Detector 2: Detecção de Copy-Move"""
     
     def __init__(self, debug=False):
         self.debug = debug
@@ -199,7 +179,7 @@ class CopyMoveDetector:
         h, w = gray.shape
         
         block_size = 16
-        threshold_similarity = 0.97  # ERA 0.95, AGORA mais rigoroso
+        threshold_similarity = 0.95
         
         blocks = []
         positions = []
@@ -231,8 +211,7 @@ class CopyMoveDetector:
                         pos_j = positions[j]
                         distance = np.sqrt((pos_i[0] - pos_j[0])**2 + (pos_i[1] - pos_j[1])**2)
                         
-                        # CALIBRADO: Distância mínima aumentada
-                        if distance > block_size * 4:  # ERA 3, AGORA 4
+                        if distance > block_size * 3:
                             similar_pairs.append((i, j, similarity, distance))
         
         if len(similar_pairs) > 0:
@@ -251,7 +230,7 @@ class CopyMoveDetector:
         }
     
     def _analyze_similar_pairs(self, similar_pairs: List, total_blocks: int) -> float:
-        """Analisa pares similares (CALIBRADO)"""
+        """Analisa pares similares"""
         if not similar_pairs:
             return 0.0
         
@@ -264,14 +243,13 @@ class CopyMoveDetector:
         similarities = [pair[2] for pair in similar_pairs]
         avg_similarity = np.mean(similarities)
         
-        # CALIBRADO: Thresholds muito mais altos
-        if cloned_ratio > 0.25 and avg_similarity > 0.99:
+        if cloned_ratio > 0.15 and avg_similarity > 0.98:
             return 0.9
-        elif cloned_ratio > 0.20 and avg_similarity > 0.985:
+        elif cloned_ratio > 0.1 and avg_similarity > 0.97:
             return 0.75
-        elif cloned_ratio > 0.15 and avg_similarity > 0.98:
+        elif cloned_ratio > 0.05 and avg_similarity > 0.96:
             return 0.6
-        elif cloned_ratio > 0.10 and avg_similarity > 0.975:
+        elif cloned_ratio > 0.03:
             return 0.4
         else:
             return 0.2
@@ -450,15 +428,13 @@ class LegitimateElementDetector:
         return None
     
     def _detect_glass_reflections(self, image: np.ndarray) -> Optional[RegionInfo]:
-        """CALIBRADO: Threshold aumentado de 5% para 15%"""
         hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
         h, w = image.shape[:2]
         
         h_channel, s_channel, v_channel = cv2.split(hsv)
         
-        # CALIBRADO: Mais rigoroso
-        low_saturation = s_channel < 40  # ERA 50
-        high_value = v_channel > 215     # ERA 200
+        low_saturation = s_channel < 50
+        high_value = v_channel > 200
         potential_reflections = (low_saturation & high_value).astype(np.uint8) * 255
         
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
@@ -479,8 +455,7 @@ class LegitimateElementDetector:
         total_area = h * w
         reflection_ratio = reflection_area / total_area
         
-        # CALIBRADO: 15% em vez de 5%
-        if reflection_ratio > 0.15:
+        if reflection_ratio > 0.05:
             contours, _ = cv2.findContours(reflection_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             if contours:
                 x, y, w_c, h_c = cv2.boundingRect(np.vstack(contours))
@@ -510,7 +485,7 @@ class LegitimateElementDetector:
 
 
 class IntegratedTextureAnalyzer:
-    """Analisador V2.5 CALIBRADO"""
+    """Analisador V2.5 CIENTÍFICO"""
     
     def __init__(self, P=8, R=1, block_size=20, threshold=0.50, debug=False):
         self.P = P
@@ -523,11 +498,10 @@ class IntegratedTextureAnalyzer:
         self.copy_move_detector = CopyMoveDetector(debug=debug)
     
     def analyze_image_integrated(self, image):
-        """Análise integrada V2.5 CALIBRADA"""
+        """Análise integrada V2.5 CIENTÍFICA"""
         if self.debug:
-            print("\n=== ANÁLISE V2.5 CALIBRADA ===")
+            print("\n=== ANÁLISE V2.5 CIENTÍFICA ===")
         
-        # FASE 1: Elementos legítimos
         legitimate_elements = self.legitimate_detector.detect_all(image)
         exclusion_mask = self.legitimate_detector.create_exclusion_mask(image.shape[:2], min_confidence=0.3)
         
@@ -536,38 +510,33 @@ class IntegratedTextureAnalyzer:
         excluded_pixels = np.sum(exclusion_mask == 255)
         exclusion_percentage = (excluded_pixels / total_pixels) * 100
         
-        # FASE 2: Análise JPEG
         jpeg_analysis = self.jpeg_analyzer.analyze_jpeg_artifacts(image)
         jpeg_score = jpeg_analysis['jpeg_artifact_score']
         
-        # FASE 3: Detecção Copy-Move
         copy_move_analysis = self.copy_move_detector.detect_copy_move(image)
         copy_move_score = copy_move_analysis['copy_move_score']
         
-        # FASE 4: Textura LBP
         texture_results = self._analyze_texture_with_mask(image, exclusion_mask)
         base_score = texture_results['naturalness_score']
         
-        # PENALIDADES RECALIBRADAS (MUITO MENOS AGRESSIVAS)
         jpeg_penalty = 0
-        if jpeg_score > 0.85:       # ERA 0.7
-            jpeg_penalty = 25       # ERA 40
-        elif jpeg_score > 0.75:     # ERA 0.5
-            jpeg_penalty = 18       # ERA 30
-        elif jpeg_score > 0.65:     # ERA 0.3
-            jpeg_penalty = 12       # ERA 20
-        elif jpeg_score > 0.50:     # ERA 0.15
-            jpeg_penalty = 6        # ERA 10
+        if jpeg_score > 0.7:
+            jpeg_penalty = 40
+        elif jpeg_score > 0.5:
+            jpeg_penalty = 30
+        elif jpeg_score > 0.3:
+            jpeg_penalty = 20
+        elif jpeg_score > 0.15:
+            jpeg_penalty = 10
         
         copy_move_penalty = 0
-        if copy_move_score > 0.85:  # ERA 0.7
-            copy_move_penalty = 20  # ERA 35
-        elif copy_move_score > 0.75: # ERA 0.5
-            copy_move_penalty = 15  # ERA 25
-        elif copy_move_score > 0.60: # ERA 0.3
-            copy_move_penalty = 8   # ERA 15
+        if copy_move_score > 0.7:
+            copy_move_penalty = 35
+        elif copy_move_score > 0.5:
+            copy_move_penalty = 25
+        elif copy_move_score > 0.3:
+            copy_move_penalty = 15
         
-        # SCORE FINAL
         final_score = max(0, base_score - jpeg_penalty - copy_move_penalty)
         
         integrated_results = {
@@ -587,9 +556,9 @@ class IntegratedTextureAnalyzer:
         
         if self.debug:
             print(f"\nRESULTADO:")
-            print(f"  Base LBP: {base_score}")
-            print(f"  JPEG penalty: -{jpeg_penalty} (score: {jpeg_score:.2%})")
-            print(f"  Copy-Move penalty: -{copy_move_penalty} (score: {copy_move_score:.2%})")
+            print(f"  Base: {base_score}")
+            print(f"  JPEG penalty: -{jpeg_penalty}")
+            print(f"  Copy-Move penalty: -{copy_move_penalty}")
             print(f"  FINAL: {final_score}")
         
         return integrated_results
@@ -667,17 +636,16 @@ class IntegratedTextureAnalyzer:
         }
     
     def _classify_naturalness(self, score):
-        """CLASSIFICAÇÃO RECALIBRADA"""
-        if score >= 75:
-            return "Textura natural", "Baixa chance de manipulação por IA"
-        elif score >= 55:
-            return "Textura suspeita", "Revisão manual recomendada - possível edição menor"
-        elif score >= 35:
-            return "Provável manipulação", "Alta probabilidade de edição por IA"
-        elif score >= 15:
-            return "Manipulação detectada", "Textura artificial forte - imagem editada"
+        if score == 0:
+            return "Erro de análise", "Score zero - Revisar imagem manualmente"
+        elif score <= 15:
+            return "Análise inconclusiva", "Score muito baixo - Possível detecção excessiva ou imagem muito manipulada"
+        elif score <= 45:
+            return "Alta chance de manipulação", "Textura artificial detectada"
+        elif score <= 70:
+            return "Textura suspeita", "Revisão manual sugerida"
         else:
-            return "Análise inconclusiva", "Score muito baixo - verificar qualidade da imagem"
+            return "Textura natural", "Baixa chance de manipulação"
     
     def generate_visual_report(self, image, integrated_results):
         if len(image.shape) == 2:
