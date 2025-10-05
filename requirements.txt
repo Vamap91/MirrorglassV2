@@ -1,21 +1,25 @@
-# MirrorGlass V2 - Requirements
-# Sistema Integrado de Detecção de Fraudes por IA
+# MirrorGlass V2.5 - Requirements
+# Otimizado para Streamlit Cloud
 
-# Core
+# Core Web Framework
 streamlit==1.28.0
+
+# Computação Numérica
 numpy==1.24.3
+
+# Processamento de Imagens
 pillow==10.1.0
 
-# Visão Computacional
-opencv-python==4.8.1.78
+# Visão Computacional (HEADLESS para Streamlit Cloud)
+opencv-python-headless==4.8.1.78
 scikit-image==0.22.0
 
-# OCR (para detecção de texto)
+# OCR (Detecção de Texto)
 pytesseract==0.3.10
 
 # Análise de Dados
 pandas==2.1.3
 scipy==1.11.4
 
-# Visualização (opcional)
+# Visualização
 matplotlib==3.8.2
