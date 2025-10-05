@@ -1,10 +1,9 @@
 # integrated_analyzer.py
 """
-MirrorGlass V2.3 - Analisador AGRESSIVO para detecção de IA
-Ajustes críticos:
-- Penalidades MUITO maiores
-- Detecção de bordas focada em inpainting de IA
-- Score invertido para privilegiar detecção de fraudes
+MirrorGlass V2.5 - ABORDAGEM CIENTÍFICA
+Baseado em papers validados:
+1. JPEG Artifact Analysis (Farid, 2009)
+2. Copy-Move Detection (Fridrich, 2003)
 """
 
 import cv2
@@ -14,6 +13,7 @@ import pytesseract
 from dataclasses import dataclass
 from skimage.feature import local_binary_pattern
 from scipy.stats import entropy
+from scipy.fft import dct, idct
 
 
 @dataclass
@@ -46,15 +46,328 @@ class LightingAnalysisResult:
         }
 
 
+class JPEGArtifactAnalyzer:
+    """
+    Detector 1: Análise de Artefatos JPEG
+    Baseado em: Farid, H. (2009) "Exposing Digital Forgeries From JPEG Ghosts"
+    
+    Princípio: IAs geram imagens com padrões JPEG inconsistentes
+    """
+    
+    def __init__(self, debug=False):
+        self.debug = debug
+    
+    def analyze_jpeg_artifacts(self, image: np.ndarray) -> Dict:
+        """
+        Analisa inconsistências em artefatos JPEG
+        
+        IAs criam padrões de compressão diferentes de câmeras reais
+        """
+        if self.debug:
+            print("\n--- Análise de Artefatos JPEG ---")
+        
+        # 1. Análise de blocos DCT 8x8
+        dct_inconsistency = self._analyze_dct_blocks(image)
+        
+        # 2. Análise de quantização
+        quantization_anomaly = self._analyze_quantization_patterns(image)
+        
+        # 3. Análise de double JPEG
+        double_jpeg_score = self._detect_double_jpeg(image)
+        
+        # Score combinado
+        jpeg_artifact_score = (
+            dct_inconsistency * 0.4 +
+            quantization_anomaly * 0.35 +
+            double_jpeg_score * 0.25
+        )
+        
+        if self.debug:
+            print(f"DCT Inconsistency: {dct_inconsistency:.2%}")
+            print(f"Quantization Anomaly: {quantization_anomaly:.2%}")
+            print(f"Double JPEG: {double_jpeg_score:.2%}")
+            print(f"TOTAL JPEG Artifact: {jpeg_artifact_score:.2%}")
+        
+        return {
+            'jpeg_artifact_score': float(jpeg_artifact_score),
+            'dct_inconsistency': float(dct_inconsistency),
+            'quantization_anomaly': float(quantization_anomaly),
+            'double_jpeg_score': float(double_jpeg_score)
+        }
+    
+    def _analyze_dct_blocks(self, image: np.ndarray) -> float:
+        """
+        Analisa blocos DCT 8x8
+        
+        Câmeras reais: blocos alinhados perfeitamente
+        IA: blocos podem ter desalinhamento sutil
+        """
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        h, w = gray.shape
+        
+        # Análise em múltiplos offsets (0,0), (4,0), (0,4), (4,4)
+        inconsistency_scores = []
+        
+        for offset_y in [0, 4]:
+            for offset_x in [0, 4]:
+                block_variance = []
+                
+                for i in range(offset_y, h - 8, 8):
+                    for j in range(offset_x, w - 8, 8):
+                        block = gray[i:i+8, j:j+8].astype(np.float64)
+                        
+                        # DCT do bloco
+                        dct_block = dct(dct(block.T, norm='ortho').T, norm='ortho')
+                        
+                        # Analisar coeficientes de alta frequência
+                        high_freq = dct_block[4:, 4:]
+                        variance = np.var(high_freq)
+                        block_variance.append(variance)
+                
+                if block_variance:
+                    # Calcular inconsistência entre blocos
+                    variance_array = np.array(block_variance)
+                    
+                    # IA tende a ter variância muito uniforme
+                    variance_of_variance = np.var(variance_array)
+                    mean_variance = np.mean(variance_array)
+                    
+                    if mean_variance > 0:
+                        cv_variance = variance_of_variance / (mean_variance + 1e-7)
+                        
+                        # Coeficiente de variação baixo = suspeito
+                        if cv_variance < 0.1:
+                            inconsistency_scores.append(0.8)
+                        elif cv_variance < 0.2:
+                            inconsistency_scores.append(0.6)
+                        elif cv_variance < 0.3:
+                            inconsistency_scores.append(0.4)
+                        else:
+                            inconsistency_scores.append(0.2)
+        
+        return np.mean(inconsistency_scores) if inconsistency_scores else 0.0
+    
+    def _analyze_quantization_patterns(self, image: np.ndarray) -> float:
+        """
+        Analisa padrões de quantização JPEG
+        
+        IAs têm padrões de quantização diferentes de câmeras
+        """
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        
+        # Calcular histograma de valores
+        hist, bins = np.histogram(gray.flatten(), bins=256, range=(0, 256))
+        
+        # Detectar periodicidade no histograma (artefato de quantização)
+        # FFT do histograma
+        hist_fft = np.fft.fft(hist)
+        power_spectrum = np.abs(hist_fft[1:128])  # Ignorar DC
+        
+        # Detectar picos periódicos
+        peaks = []
+        for i in range(1, len(power_spectrum) - 1):
+            if power_spectrum[i] > power_spectrum[i-1] and power_spectrum[i] > power_spectrum[i+1]:
+                if power_spectrum[i] > np.mean(power_spectrum) * 2:
+                    peaks.append(power_spectrum[i])
+        
+        if len(peaks) > 0:
+            # Muitos picos = quantização artificial
+            peak_strength = np.mean(peaks) / (np.mean(power_spectrum) + 1e-7)
+            
+            if peak_strength > 5:
+                return 0.8
+            elif peak_strength > 3:
+                return 0.6
+            elif peak_strength > 2:
+                return 0.4
+            else:
+                return 0.2
+        
+        return 0.0
+    
+    def _detect_double_jpeg(self, image: np.ndarray) -> float:
+        """
+        Detecta double JPEG compression
+        
+        IA gera imagem, salva JPEG, edita, salva novamente = double JPEG
+        """
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        h, w = gray.shape
+        
+        # Analisar blocos 8x8 para detectar double quantization
+        double_jpeg_indicators = []
+        
+        for i in range(0, h - 8, 8):
+            for j in range(0, w - 8, 8):
+                block = gray[i:i+8, j:j+8].astype(np.float64)
+                
+                # DCT
+                dct_block = dct(dct(block.T, norm='ortho').T, norm='ortho')
+                
+                # Analisar distribuição de coeficientes
+                coeffs_flat = dct_block.flatten()
+                
+                # Histograma de coeficientes
+                hist, _ = np.histogram(coeffs_flat, bins=50)
+                
+                # Double JPEG tem "vales" no histograma
+                # Detectar padrão de vales
+                valleys = 0
+                for k in range(1, len(hist) - 1):
+                    if hist[k] < hist[k-1] and hist[k] < hist[k+1]:
+                        if hist[k-1] > 0 and hist[k+1] > 0:
+                            valleys += 1
+                
+                # Muitos vales = double JPEG
+                if valleys > 5:
+                    double_jpeg_indicators.append(1)
+                else:
+                    double_jpeg_indicators.append(0)
+        
+        if double_jpeg_indicators:
+            double_jpeg_ratio = np.mean(double_jpeg_indicators)
+            
+            if double_jpeg_ratio > 0.3:
+                return 0.8
+            elif double_jpeg_ratio > 0.2:
+                return 0.6
+            elif double_jpeg_ratio > 0.1:
+                return 0.4
+            else:
+                return 0.2
+        
+        return 0.0
+
+
+class CopyMoveDetector:
+    """
+    Detector 2: Detecção de Copy-Move (Clonagem)
+    Baseado em: Fridrich et al. (2003) "Detection of Copy-Move Forgery in Digital Images"
+    
+    Princípio: IAs de inpainting copiam/colam texturas de outras partes
+    """
+    
+    def __init__(self, debug=False):
+        self.debug = debug
+    
+    def detect_copy_move(self, image: np.ndarray) -> Dict:
+        """
+        Detecta regiões clonadas/copiadas
+        
+        Método: Block matching com DCT
+        """
+        if self.debug:
+            print("\n--- Detecção de Copy-Move ---")
+        
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        h, w = gray.shape
+        
+        # Parâmetros calibrados
+        block_size = 16
+        threshold_similarity = 0.95  # Similaridade muito alta = suspeito
+        
+        # Extrair blocos sobrepostos
+        blocks = []
+        positions = []
+        
+        step = block_size // 2  # Overlap de 50%
+        
+        for i in range(0, h - block_size, step):
+            for j in range(0, w - block_size, step):
+                block = gray[i:i+block_size, j:j+block_size]
+                
+                # DCT do bloco para invariância a pequenas mudanças
+                dct_block = dct(dct(block.T, norm='ortho').T, norm='ortho')
+                
+                # Usar apenas coeficientes de baixa frequência (mais robustos)
+                features = dct_block[:8, :8].flatten()
+                
+                blocks.append(features)
+                positions.append((i, j))
+        
+        blocks = np.array(blocks)
+        
+        # Encontrar blocos similares
+        similar_pairs = []
+        n_blocks = len(blocks)
+        
+        for i in range(n_blocks):
+            for j in range(i + 1, n_blocks):
+                # Calcular distância euclidiana normalizada
+                dist = np.linalg.norm(blocks[i] - blocks[j])
+                norm = np.linalg.norm(blocks[i]) + np.linalg.norm(blocks[j])
+                
+                if norm > 0:
+                    similarity = 1 - (dist / norm)
+                    
+                    if similarity > threshold_similarity:
+                        # Verificar se blocos não são adjacentes
+                        pos_i = positions[i]
+                        pos_j = positions[j]
+                        
+                        distance = np.sqrt((pos_i[0] - pos_j[0])**2 + (pos_i[1] - pos_j[1])**2)
+                        
+                        # Só considerar se estão longe (não adjacentes)
+                        if distance > block_size * 3:
+                            similar_pairs.append((i, j, similarity, distance))
+        
+        # Analisar pares similares
+        if len(similar_pairs) > 0:
+            # Agrupar pares em clusters
+            copy_move_score = self._analyze_similar_pairs(similar_pairs, n_blocks)
+        else:
+            copy_move_score = 0.0
+        
+        if self.debug:
+            print(f"Similar pairs found: {len(similar_pairs)}")
+            print(f"Copy-Move Score: {copy_move_score:.2%}")
+        
+        return {
+            'copy_move_score': float(copy_move_score),
+            'similar_pairs_count': len(similar_pairs),
+            'total_blocks': n_blocks
+        }
+    
+    def _analyze_similar_pairs(self, similar_pairs: List, total_blocks: int) -> float:
+        """
+        Analisa pares similares para determinar se há clonagem
+        """
+        if not similar_pairs:
+            return 0.0
+        
+        # Calcular ratio de blocos envolvidos em clonagem
+        unique_blocks = set()
+        for pair in similar_pairs:
+            unique_blocks.add(pair[0])
+            unique_blocks.add(pair[1])
+        
+        cloned_ratio = len(unique_blocks) / total_blocks
+        
+        # Analisar padrão de similaridades
+        similarities = [pair[2] for pair in similar_pairs]
+        avg_similarity = np.mean(similarities)
+        
+        # Score baseado em ratio e similaridade
+        if cloned_ratio > 0.15 and avg_similarity > 0.98:
+            return 0.9
+        elif cloned_ratio > 0.1 and avg_similarity > 0.97:
+            return 0.75
+        elif cloned_ratio > 0.05 and avg_similarity > 0.96:
+            return 0.6
+        elif cloned_ratio > 0.03:
+            return 0.4
+        else:
+            return 0.2
+
+
 class LegitimateElementDetector:
-    """Detecta elementos legítimos (texto, papel, reflexos)"""
+    """Detecta elementos legítimos (mantido do código anterior)"""
     
     def __init__(self, debug=False):
         self.debug = debug
         self.detection_results = {}
         
     def detect_all(self, image: np.ndarray) -> Dict[str, RegionInfo]:
-        """Detecta todos os elementos legítimos"""
         if image is None or image.size == 0:
             raise ValueError("Imagem inválida")
             
@@ -66,7 +379,7 @@ class LegitimateElementDetector:
                 results['text'] = text_regions
         except Exception as e:
             if self.debug:
-                print(f"Erro na detecção de texto: {e}")
+                print(f"Erro texto: {e}")
             
         try:
             paper_regions = self._detect_paper_regions(image)
@@ -74,7 +387,7 @@ class LegitimateElementDetector:
                 results['paper'] = paper_regions
         except Exception as e:
             if self.debug:
-                print(f"Erro na detecção de papel: {e}")
+                print(f"Erro papel: {e}")
             
         try:
             reflection_regions = self._detect_glass_reflections(image)
@@ -82,13 +395,12 @@ class LegitimateElementDetector:
                 results['reflections'] = reflection_regions
         except Exception as e:
             if self.debug:
-                print(f"Erro na detecção de reflexos: {e}")
+                print(f"Erro reflexos: {e}")
         
         self.detection_results = results
         return results
     
     def _detect_text_regions(self, image: np.ndarray) -> Optional[RegionInfo]:
-        """Detecta regiões com texto"""
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         h, w = gray.shape
         text_mask = np.zeros((h, w), dtype=np.uint8)
@@ -107,28 +419,24 @@ class LegitimateElementDetector:
                 if int(conf) > 30:
                     text = str(data['text'][i]).strip()
                     
-                    if len(text) >= 2:
-                        alnum_count = sum(c.isalnum() for c in text)
-                        if alnum_count >= 2:
-                            x, y = int(data['left'][i]), int(data['top'][i])
-                            w_box, h_box = int(data['width'][i]), int(data['height'][i])
+                    if len(text) >= 2 and sum(c.isalnum() for c in text) >= 2:
+                        x, y = int(data['left'][i]), int(data['top'][i])
+                        w_box, h_box = int(data['width'][i]), int(data['height'][i])
+                        
+                        if w_box > 0 and h_box > 0:
+                            padding = 10
+                            x1 = max(0, x - padding)
+                            y1 = max(0, y - padding)
+                            x2 = min(w, x + w_box + padding)
+                            y2 = min(h, y + h_box + padding)
                             
-                            if w_box > 0 and h_box > 0:
-                                padding = 10
-                                x1 = max(0, x - padding)
-                                y1 = max(0, y - padding)
-                                x2 = min(w, x + w_box + padding)
-                                y2 = min(h, y + h_box + padding)
-                                
-                                text_mask[y1:y2, x1:x2] = 255
-                                
-                                valid_text_count += 1
-                                total_conf += int(conf)
-                                detected_texts.append(text)
+                            text_mask[y1:y2, x1:x2] = 255
+                            valid_text_count += 1
+                            total_conf += int(conf)
+                            detected_texts.append(text)
             
             if valid_text_count > 0:
                 avg_conf = total_conf / valid_text_count
-                
                 kernel = np.ones((15, 15), np.uint8)
                 text_mask = cv2.dilate(text_mask, kernel, iterations=1)
                 
@@ -153,7 +461,6 @@ class LegitimateElementDetector:
         return None
     
     def _detect_paper_regions(self, image: np.ndarray) -> Optional[RegionInfo]:
-        """Detecta papéis uniformes"""
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         h, w = gray.shape
         paper_mask = np.zeros((h, w), dtype=np.uint8)
@@ -180,40 +487,31 @@ class LegitimateElementDetector:
         for contour in contours:
             area = cv2.contourArea(contour)
             
-            min_area = 5000
-            max_area = h * w * 0.6
-            
-            if area < min_area or area > max_area:
-                continue
-            
-            peri = cv2.arcLength(contour, True)
-            approx = cv2.approxPolyDP(contour, 0.04 * peri, True)
-            
-            if 4 <= len(approx) <= 6:
-                x, y, w_c, h_c = cv2.boundingRect(contour)
+            if 5000 < area < h * w * 0.6:
+                peri = cv2.arcLength(contour, True)
+                approx = cv2.approxPolyDP(contour, 0.04 * peri, True)
                 
-                aspect_ratio = float(w_c) / h_c if h_c > 0 else 0
-                if aspect_ratio < 0.3 or aspect_ratio > 3.0:
-                    continue
-                
-                roi_uniform = uniform_mask[y:y+h_c, x:x+w_c]
-                if roi_uniform.size == 0:
-                    continue
+                if 4 <= len(approx) <= 6:
+                    x, y, w_c, h_c = cv2.boundingRect(contour)
+                    aspect_ratio = float(w_c) / h_c if h_c > 0 else 0
                     
-                uniformity_ratio = np.sum(roi_uniform == 255) / roi_uniform.size
-                
-                if uniformity_ratio > 0.5:
-                    roi_color = gray[y:y+h_c, x:x+w_c]
-                    mean_brightness = np.mean(roi_color)
-                    
-                    if mean_brightness > 100:
-                        cv2.drawContours(paper_mask, [contour], -1, 255, -1)
-                        valid_papers.append({
-                            'bbox': (int(x), int(y), int(w_c), int(h_c)),
-                            'uniformity': float(uniformity_ratio),
-                            'brightness': float(mean_brightness),
-                            'area': float(area)
-                        })
+                    if 0.3 < aspect_ratio < 3.0:
+                        roi_uniform = uniform_mask[y:y+h_c, x:x+w_c]
+                        
+                        if roi_uniform.size > 0:
+                            uniformity_ratio = np.sum(roi_uniform == 255) / roi_uniform.size
+                            
+                            if uniformity_ratio > 0.5:
+                                roi_color = gray[y:y+h_c, x:x+w_c]
+                                mean_brightness = np.mean(roi_color)
+                                
+                                if mean_brightness > 100:
+                                    cv2.drawContours(paper_mask, [contour], -1, 255, -1)
+                                    valid_papers.append({
+                                        'bbox': (int(x), int(y), int(w_c), int(h_c)),
+                                        'uniformity': float(uniformity_ratio),
+                                        'brightness': float(mean_brightness)
+                                    })
         
         if valid_papers:
             avg_uniformity = np.mean([p['uniformity'] for p in valid_papers])
@@ -229,22 +527,19 @@ class LegitimateElementDetector:
                 confidence=float(avg_uniformity),
                 type='paper',
                 bbox=(int(x_min), int(y_min), int(x_max - x_min), int(y_max - y_min)),
-                metadata={'paper_count': len(valid_papers), 'papers': valid_papers}
+                metadata={'paper_count': len(valid_papers)}
             )
         
         return None
     
     def _detect_glass_reflections(self, image: np.ndarray) -> Optional[RegionInfo]:
-        """Detecta reflexos em vidro"""
         hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
         h, w = image.shape[:2]
         
         h_channel, s_channel, v_channel = cv2.split(hsv)
-        reflection_mask = np.zeros((h, w), dtype=np.uint8)
         
         low_saturation = s_channel < 50
         high_value = v_channel > 200
-        
         potential_reflections = (low_saturation & high_value).astype(np.uint8) * 255
         
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
@@ -255,7 +550,6 @@ class LegitimateElementDetector:
         grad_mag = np.sqrt(grad_x**2 + grad_y**2)
         
         smooth_gradients = ((grad_mag > 10) & (grad_mag < 80)).astype(np.uint8) * 255
-        
         reflection_mask = cv2.bitwise_and(potential_reflections, smooth_gradients)
         
         kernel = np.ones((5, 5), np.uint8)
@@ -285,7 +579,6 @@ class LegitimateElementDetector:
         return None
     
     def create_exclusion_mask(self, image_shape: Tuple[int, int], min_confidence: float = 0.3) -> np.ndarray:
-        """Cria máscara de exclusão"""
         h, w = image_shape
         exclusion_mask = np.zeros((h, w), dtype=np.uint8)
         
@@ -296,459 +589,26 @@ class LegitimateElementDetector:
         return exclusion_mask
 
 
-class EdgeAnalyzer:
-    """
-    V2.3: Detecção AGRESSIVA de bordas de inpainting
-    Foco: detectar transições artificiais de IA, NÃO bordas naturais de objetos
-    """
-    
-    def __init__(self, debug=False):
-        self.debug = debug
-    
-    def analyze_edges(self, image: np.ndarray) -> Dict:
-        """Analisa bordas FOCANDO em artefatos de IA"""
-        if image is None or image.size == 0:
-            raise ValueError("Imagem inválida")
-        
-        h, w = image.shape[:2]
-        
-        if self.debug:
-            print("\n--- Análise de Bordas (AGRESSIVA) ---")
-        
-        # NOVA ABORDAGEM: Detectar inpainting especificamente
-        inpainting_score = self._detect_inpainting_artifacts(image)
-        blend_artifact_score = self._detect_blend_artifacts(image)
-        frequency_anomaly_score = self._detect_frequency_anomalies(image)
-        
-        # Score combinado MUITO mais agressivo
-        edge_artifact_score = (
-            inpainting_score * 0.5 +      # Peso ALTO para inpainting
-            blend_artifact_score * 0.3 +   # Peso MÉDIO para blending
-            frequency_anomaly_score * 0.2  # Peso BAIXO para frequência
-        )
-        
-        if self.debug:
-            print(f"Inpainting: {inpainting_score:.2%}")
-            print(f"Blend: {blend_artifact_score:.2%}")
-            print(f"Frequency: {frequency_anomaly_score:.2%}")
-            print(f"TOTAL Edge Artifact: {edge_artifact_score:.2%}")
-        
-        # Criar máscara combinada
-        artificial_edge_mask = self._create_inpainting_mask(image, inpainting_score)
-        
-        return {
-            'edge_artifact_score': float(edge_artifact_score),
-            'inpainting_score': float(inpainting_score),
-            'blend_artifact_score': float(blend_artifact_score),
-            'frequency_anomaly_score': float(frequency_anomaly_score),
-            'artificial_edge_mask': artificial_edge_mask,
-            'canny_edges': None,
-            'smooth_edges': None
-        }
-    
-    def _detect_inpainting_artifacts(self, image: np.ndarray) -> float:
-        """
-        Detecta artefatos específicos de inpainting por IA
-        VERSÃO ULTRA AGRESSIVA
-        """
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        h, w = gray.shape
-        
-        # Múltiplas análises combinadas
-        kernel_size = 15
-        gray_float = gray.astype(np.float32)
-        
-        mean = cv2.blur(gray_float, (kernel_size, kernel_size))
-        mean_sq = cv2.blur(gray_float**2, (kernel_size, kernel_size))
-        variance = mean_sq - mean**2
-        variance = np.maximum(variance, 0)
-        texture_map = np.sqrt(variance)
-        
-        # Gradientes de textura e cor
-        texture_grad_x = cv2.Sobel(texture_map, cv2.CV_64F, 1, 0, ksize=5)
-        texture_grad_y = cv2.Sobel(texture_map, cv2.CV_64F, 0, 1, ksize=5)
-        texture_change = np.sqrt(texture_grad_x**2 + texture_grad_y**2)
-        
-        color_grad_x = cv2.Sobel(gray_float, cv2.CV_64F, 1, 0, ksize=5)
-        color_grad_y = cv2.Sobel(gray_float, cv2.CV_64F, 0, 1, ksize=5)
-        color_change = np.sqrt(color_grad_x**2 + color_grad_y**2)
-        
-        texture_norm = cv2.normalize(texture_change, None, 0, 1, cv2.NORM_MINMAX)
-        color_norm = cv2.normalize(color_change, None, 0, 1, cv2.NORM_MINMAX)
-        
-        # Indicador de inpainting
-        inpainting_indicator = texture_norm * (1 - color_norm)
-        
-        # THRESHOLDS MUITO MAIS AGRESSIVOS
-        threshold = 0.2  # Diminuído de 0.3
-        suspicious_ratio = np.sum(inpainting_indicator > threshold) / (h * w)
-        
-        # Escala MUITO mais sensível
-        if suspicious_ratio > 0.08:  # Diminuído de 0.15
-            return 0.95
-        elif suspicious_ratio > 0.04:  # Diminuído de 0.08
-            return 0.85
-        elif suspicious_ratio > 0.02:  # Diminuído de 0.03
-            return 0.65
-        elif suspicious_ratio > 0.01:
-            return 0.45
-        else:
-            return suspicious_ratio * 20  # Aumentado de 5
-    
-    def _detect_blend_artifacts(self, image: np.ndarray) -> float:
-        """
-        Detecta artefatos de blending MAIS AGRESSIVO
-        """
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        h, w = gray.shape
-        
-        laplacians = []
-        
-        for sigma in [1, 2, 4]:
-            blurred = cv2.GaussianBlur(gray, (0, 0), sigma)
-            laplacian = cv2.Laplacian(blurred, cv2.CV_64F, ksize=5)
-            laplacians.append(np.abs(laplacian))
-        
-        ratio_12 = laplacians[0] / (laplacians[1] + 1e-7)
-        ratio_23 = laplacians[1] / (laplacians[2] + 1e-7)
-        
-        ratio_12_norm = cv2.normalize(ratio_12, None, 0, 1, cv2.NORM_MINMAX)
-        ratio_23_norm = cv2.normalize(ratio_23, None, 0, 1, cv2.NORM_MINMAX)
-        
-        variance_r12 = np.var(ratio_12_norm)
-        variance_r23 = np.var(ratio_23_norm)
-        
-        # MUITO mais sensível
-        blend_score = 0
-        
-        if variance_r12 < 0.02 and variance_r23 < 0.02:  # Diminuído de 0.01
-            blend_score = 0.9  # Aumentado de 0.8
-        elif variance_r12 < 0.05 or variance_r23 < 0.05:  # Diminuído de 0.03
-            blend_score = 0.7  # Aumentado de 0.5
-        elif variance_r12 < 0.08 or variance_r23 < 0.08:  # Diminuído de 0.05
-            blend_score = 0.5  # Aumentado de 0.3
-        else:
-            blend_score = max(0, 0.5 - variance_r12 - variance_r23)
-        
-        return float(blend_score)
-    
-    def _detect_frequency_anomalies(self, image: np.ndarray) -> float:
-        """
-        Detecta anomalias de frequência (FFT simplificado)
-        
-        IA deixa "impressão digital" em certas frequências
-        """
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        h, w = gray.shape
-        
-        # Dividir em patches e analisar
-        patch_size = 64
-        anomaly_count = 0
-        total_patches = 0
-        
-        for i in range(0, h - patch_size, patch_size):
-            for j in range(0, w - patch_size, patch_size):
-                patch = gray[i:i+patch_size, j:j+patch_size]
-                
-                if patch.shape[0] != patch_size or patch.shape[1] != patch_size:
-                    continue
-                
-                total_patches += 1
-                
-                # Análise espectral simplificada
-                # Calcular energia em diferentes frequências
-                high_freq = cv2.Laplacian(patch, cv2.CV_64F)
-                low_freq = cv2.GaussianBlur(patch, (5, 5), 0)
-                
-                high_energy = np.sum(np.abs(high_freq))
-                low_energy = np.sum(np.abs(patch.astype(float) - low_freq))
-                
-                # Razão anômala = possível IA
-                if high_energy > 0:
-                    ratio = low_energy / high_energy
-                    
-                    # IA tende a ter razão específica
-                    if 0.8 < ratio < 1.2:
-                        anomaly_count += 1
-        
-        if total_patches > 0:
-            anomaly_ratio = anomaly_count / total_patches
-            
-            if anomaly_ratio > 0.6:
-                return 0.7
-            elif anomaly_ratio > 0.4:
-                return 0.5
-            else:
-                return anomaly_ratio
-        
-        return 0.0
-    
-    def _create_inpainting_mask(self, image: np.ndarray, inpainting_score: float) -> np.ndarray:
-        """Cria máscara de áreas com inpainting"""
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        h, w = gray.shape
-        
-        # Se score alto, marcar áreas suspeitas
-        if inpainting_score < 0.3:
-            return np.zeros((h, w), dtype=np.uint8)
-        
-        # Detectar áreas com textura anômala
-        kernel_size = 15
-        gray_float = gray.astype(np.float32)
-        
-        mean = cv2.blur(gray_float, (kernel_size, kernel_size))
-        mean_sq = cv2.blur(gray_float**2, (kernel_size, kernel_size))
-        variance = mean_sq - mean**2
-        variance = np.maximum(variance, 0)
-        texture_map = np.sqrt(variance)
-        
-        texture_grad_x = cv2.Sobel(texture_map, cv2.CV_64F, 1, 0, ksize=5)
-        texture_grad_y = cv2.Sobel(texture_map, cv2.CV_64F, 0, 1, ksize=5)
-        texture_change = np.sqrt(texture_grad_x**2 + texture_grad_y**2)
-        
-        texture_norm = cv2.normalize(texture_change, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-        
-        _, mask = cv2.threshold(texture_norm, 80, 255, cv2.THRESH_BINARY)
-        
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
-        mask = cv2.dilate(mask, kernel, iterations=2)
-        
-        return mask
-
-
-class LightingAnalyzer:
-    """V2.1: Analisa inconsistências de iluminação"""
-    
-    def __init__(self, debug=False):
-        self.debug = debug
-        
-    def analyze_lighting(self, image: np.ndarray) -> LightingAnalysisResult:
-        if image is None or image.size == 0:
-            raise ValueError("Imagem inválida")
-        
-        h, w = image.shape[:2]
-        
-        shadow_map = self._detect_shadows(image)
-        highlight_map = self._detect_highlights(image)
-        lighting_direction_map = self._calculate_lighting_directions(image)
-        inconsistency_mask, inconsistency_score, metadata = self._detect_inconsistencies(
-            image, shadow_map, highlight_map, lighting_direction_map
-        )
-        suspicious_regions = self._find_suspicious_regions(inconsistency_mask)
-        
-        return LightingAnalysisResult(
-            inconsistency_mask=inconsistency_mask,
-            inconsistency_score=inconsistency_score,
-            shadow_map=shadow_map,
-            highlight_map=highlight_map,
-            lighting_direction_map=lighting_direction_map,
-            suspicious_regions=suspicious_regions,
-            metadata=metadata
-        )
-    
-    def _detect_shadows(self, image: np.ndarray) -> np.ndarray:
-        hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
-        lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
-        
-        h, s, v = cv2.split(hsv)
-        l_channel, a_channel, b_channel = cv2.split(lab)
-        
-        low_value = v < 100
-        low_lightness = l_channel < 80
-        not_black = v > 20
-        
-        shadow_mask = (low_value & low_lightness & not_black).astype(np.uint8) * 255
-        
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-        shadow_mask = cv2.morphologyEx(shadow_mask, cv2.MORPH_OPEN, kernel)
-        shadow_mask = cv2.morphologyEx(shadow_mask, cv2.MORPH_CLOSE, kernel)
-        shadow_mask = cv2.GaussianBlur(shadow_mask, (7, 7), 0)
-        
-        return shadow_mask
-    
-    def _detect_highlights(self, image: np.ndarray) -> np.ndarray:
-        hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
-        h, s, v = cv2.split(hsv)
-        
-        high_value = v > 200
-        low_saturation = s < 50
-        
-        b, g, r = cv2.split(image)
-        rg_diff = np.abs(r.astype(float) - g.astype(float))
-        gb_diff = np.abs(g.astype(float) - b.astype(float))
-        rb_diff = np.abs(r.astype(float) - b.astype(float))
-        
-        max_diff = np.maximum(np.maximum(rg_diff, gb_diff), rb_diff)
-        near_white = max_diff < 30
-        
-        highlight_mask = (high_value & low_saturation & near_white).astype(np.uint8) * 255
-        
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-        highlight_mask = cv2.morphologyEx(highlight_mask, cv2.MORPH_OPEN, kernel)
-        highlight_mask = cv2.GaussianBlur(highlight_mask, (5, 5), 0)
-        
-        return highlight_mask
-    
-    def _calculate_lighting_directions(self, image: np.ndarray) -> np.ndarray:
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        gray_smooth = cv2.GaussianBlur(gray, (5, 5), 0)
-        
-        grad_x = cv2.Sobel(gray_smooth, cv2.CV_64F, 1, 0, ksize=5)
-        grad_y = cv2.Sobel(gray_smooth, cv2.CV_64F, 0, 1, ksize=5)
-        
-        magnitude = np.sqrt(grad_x**2 + grad_y**2)
-        angle = np.arctan2(grad_y, grad_x)
-        angle_degrees = np.degrees(angle) % 360
-        
-        magnitude_norm = cv2.normalize(magnitude, None, 0, 1, cv2.NORM_MINMAX)
-        
-        angle_weighted = angle_degrees.copy()
-        angle_weighted[magnitude_norm < 0.1] = -1
-        
-        return angle_weighted
-    
-    def _detect_inconsistencies(self, image, shadow_map, highlight_map, lighting_direction_map) -> Tuple[np.ndarray, float, Dict]:
-        h, w = image.shape[:2]
-        inconsistency_mask = np.zeros((h, w), dtype=np.uint8)
-        
-        metadata = {}
-        
-        highlight_orphan_mask = self._detect_orphan_highlights(image, highlight_map, shadow_map)
-        inconsistency_mask = cv2.bitwise_or(inconsistency_mask, highlight_orphan_mask)
-        metadata['orphan_highlights_ratio'] = float(np.sum(highlight_orphan_mask > 0) / (h * w))
-        
-        transition_mask = self._detect_abrupt_transitions(image)
-        inconsistency_mask = cv2.bitwise_or(inconsistency_mask, transition_mask)
-        metadata['abrupt_transitions_ratio'] = float(np.sum(transition_mask > 0) / (h * w))
-        
-        shadow_anomaly_mask = self._detect_shadow_anomalies(shadow_map)
-        inconsistency_mask = cv2.bitwise_or(inconsistency_mask, shadow_anomaly_mask)
-        metadata['shadow_anomalies_ratio'] = float(np.sum(shadow_anomaly_mask > 0) / (h * w))
-        
-        inconsistency_score = (
-            metadata['orphan_highlights_ratio'] * 0.4 +
-            metadata['abrupt_transitions_ratio'] * 0.4 +
-            metadata['shadow_anomalies_ratio'] * 0.2
-        )
-        
-        metadata['total_inconsistency_ratio'] = float(np.sum(inconsistency_mask > 0) / (h * w))
-        metadata['weighted_score'] = float(inconsistency_score)
-        
-        return inconsistency_mask, inconsistency_score, metadata
-    
-    def _detect_orphan_highlights(self, image, highlight_map, shadow_map) -> np.ndarray:
-        h, w = image.shape[:2]
-        orphan_mask = np.zeros((h, w), dtype=np.uint8)
-        
-        highlight_binary = (highlight_map > 50).astype(np.uint8)
-        shadow_binary = (shadow_map > 50).astype(np.uint8)
-        
-        highlight_contours, _ = cv2.findContours(highlight_binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        
-        for contour in highlight_contours:
-            area = cv2.contourArea(contour)
-            if area < 100:
-                continue
-            
-            x, y, w_box, h_box = cv2.boundingRect(contour)
-            search_radius = int(max(w_box, h_box) * 2)
-            
-            x1 = max(0, x - search_radius)
-            y1 = max(0, y - search_radius)
-            x2 = min(w, x + w_box + search_radius)
-            y2 = min(h, y + h_box + search_radius)
-            
-            search_region = shadow_binary[y1:y2, x1:x2]
-            
-            if search_region.size > 0:
-                shadow_ratio = np.sum(search_region) / search_region.size
-                
-                if shadow_ratio < 0.05:
-                    cv2.drawContours(orphan_mask, [contour], -1, 255, -1)
-        
-        return orphan_mask
-    
-    def _detect_abrupt_transitions(self, image) -> np.ndarray:
-        lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
-        l_channel = lab[:, :, 0]
-        
-        laplacian = cv2.Laplacian(l_channel, cv2.CV_64F, ksize=5)
-        laplacian_abs = np.abs(laplacian)
-        laplacian_norm = cv2.normalize(laplacian_abs, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-        
-        _, transition_mask = cv2.threshold(laplacian_norm, 100, 255, cv2.THRESH_BINARY)
-        
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-        transition_mask = cv2.morphologyEx(transition_mask, cv2.MORPH_OPEN, kernel)
-        
-        return transition_mask
-    
-    def _detect_shadow_anomalies(self, shadow_map) -> np.ndarray:
-        h, w = shadow_map.shape
-        anomaly_mask = np.zeros((h, w), dtype=np.uint8)
-        
-        _, shadow_binary = cv2.threshold(shadow_map, 50, 255, cv2.THRESH_BINARY)
-        contours, _ = cv2.findContours(shadow_binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        
-        for contour in contours:
-            area = cv2.contourArea(contour)
-            if area < 500:
-                continue
-            
-            mask = np.zeros((h, w), dtype=np.uint8)
-            cv2.drawContours(mask, [contour], -1, 255, -1)
-            
-            shadow_region = shadow_map[mask == 255]
-            
-            if len(shadow_region) > 0:
-                std_dev = np.std(shadow_region)
-                
-                if std_dev < 5:
-                    cv2.drawContours(anomaly_mask, [contour], -1, 255, -1)
-        
-        return anomaly_mask
-    
-    def _find_suspicious_regions(self, inconsistency_mask) -> List[Tuple[int, int, int, int]]:
-        contours, _ = cv2.findContours(inconsistency_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        
-        suspicious_regions = []
-        
-        for contour in contours:
-            area = cv2.contourArea(contour)
-            if area > 200:
-                x, y, w, h = cv2.boundingRect(contour)
-                suspicious_regions.append((int(x), int(y), int(w), int(h)))
-        
-        return suspicious_regions
-
-
 class IntegratedTextureAnalyzer:
     """
-    Analisador integrado V2.3 AGRESSIVO
-    
-    MUDANÇAS CRÍTICAS:
-    - Penalidades MUITO maiores para bordas e iluminação
-    - Detecção de bordas focada em inpainting (não bordas naturais)
-    - Score privilegia detecção de fraudes
+    Analisador V2.5 - CIENTÍFICO
+    Combina detectores validados cientificamente
     """
     
-    def __init__(self, P=8, R=1, block_size=20, threshold=0.50, 
-                 enable_lighting_analysis=True, enable_edge_analysis=True, debug=False):
+    def __init__(self, P=8, R=1, block_size=20, threshold=0.50, debug=False):
         self.P = P
         self.R = R
         self.block_size = block_size
         self.threshold = threshold
-        self.enable_lighting_analysis = enable_lighting_analysis
-        self.enable_edge_analysis = enable_edge_analysis
         self.debug = debug
         self.legitimate_detector = LegitimateElementDetector(debug=debug)
-        self.lighting_analyzer = LightingAnalyzer(debug=debug) if enable_lighting_analysis else None
-        self.edge_analyzer = EdgeAnalyzer(debug=debug) if enable_edge_analysis else None
+        self.jpeg_analyzer = JPEGArtifactAnalyzer(debug=debug)
+        self.copy_move_detector = CopyMoveDetector(debug=debug)
     
     def analyze_image_integrated(self, image):
-        """Análise integrada V2.3 AGRESSIVA"""
+        """Análise integrada V2.5 CIENTÍFICA"""
         if self.debug:
-            print("\n=== ANÁLISE V2.3 AGRESSIVA ===")
+            print("\n=== ANÁLISE V2.5 CIENTÍFICA ===")
         
         # FASE 1: Elementos legítimos
         legitimate_elements = self.legitimate_detector.detect_all(image)
@@ -759,74 +619,48 @@ class IntegratedTextureAnalyzer:
         excluded_pixels = np.sum(exclusion_mask == 255)
         exclusion_percentage = (excluded_pixels / total_pixels) * 100
         
-        if self.debug:
-            print(f"FASE 1: Excluído: {exclusion_percentage:.1f}%")
+        # FASE 2: Análise JPEG (validada cientificamente)
+        jpeg_analysis = self.jpeg_analyzer.analyze_jpeg_artifacts(image)
+        jpeg_score = jpeg_analysis['jpeg_artifact_score']
         
-        # FASE 2: Iluminação (penalidade AUMENTADA)
-        lighting_result = None
-        lighting_score_penalty = 0
+        # FASE 3: Detecção Copy-Move (validada cientificamente)
+        copy_move_analysis = self.copy_move_detector.detect_copy_move(image)
+        copy_move_score = copy_move_analysis['copy_move_score']
         
-        if self.enable_lighting_analysis and self.lighting_analyzer:
-            try:
-                lighting_result = self.lighting_analyzer.analyze_lighting(image)
-                
-                # PENALIDADE AGRESSIVA (até -40 pontos)
-                lighting_score_penalty = int(lighting_result.inconsistency_score * 40)
-                
-                if self.debug:
-                    print(f"FASE 2: Luz penalty: -{lighting_score_penalty}")
-            except Exception as e:
-                if self.debug:
-                    print(f"Erro luz: {e}")
-        
-        # FASE 3: BORDAS AGRESSIVAS (penalidade MUITO AUMENTADA)
-        edge_result = None
-        edge_score_penalty = 0
-        
-        if self.enable_edge_analysis and self.edge_analyzer:
-            try:
-                edge_result = self.edge_analyzer.analyze_edges(image)
-                edge_artifact = edge_result['edge_artifact_score']
-                
-                # SISTEMA DE PENALIDADE EXTREMAMENTE AGRESSIVO
-                # Qualquer sinal de artefato = penalidade grande
-                if edge_artifact > 0.8:
-                    edge_score_penalty = 60  # PENALIDADE MASSIVA
-                elif edge_artifact > 0.6:
-                    edge_score_penalty = 55
-                elif edge_artifact > 0.4:
-                    edge_score_penalty = 50
-                elif edge_artifact > 0.25:
-                    edge_score_penalty = 45
-                elif edge_artifact > 0.15:
-                    edge_score_penalty = 35
-                elif edge_artifact > 0.08:
-                    edge_score_penalty = 25
-                else:
-                    edge_score_penalty = int(edge_artifact * 150)  # Multiplicador alto
-                
-                if self.debug:
-                    print(f"FASE 3: Edge artifact: {edge_artifact:.2%} → penalty: -{edge_score_penalty}")
-            except Exception as e:
-                if self.debug:
-                    print(f"Erro bordas: {e}")
-        
-        # FASE 4: Textura LBP
+        # FASE 4: Textura LBP (baseline)
         texture_results = self._analyze_texture_with_mask(image, exclusion_mask)
-        
         base_score = texture_results['naturalness_score']
         
-        # SCORE FINAL COM PENALIDADES AGRESSIVAS
-        final_score = max(0, base_score - lighting_score_penalty - edge_score_penalty)
+        # PENALIDADES CALIBRADAS CIENTIFICAMENTE
+        jpeg_penalty = 0
+        if jpeg_score > 0.7:
+            jpeg_penalty = 40
+        elif jpeg_score > 0.5:
+            jpeg_penalty = 30
+        elif jpeg_score > 0.3:
+            jpeg_penalty = 20
+        elif jpeg_score > 0.15:
+            jpeg_penalty = 10
+        
+        copy_move_penalty = 0
+        if copy_move_score > 0.7:
+            copy_move_penalty = 35
+        elif copy_move_score > 0.5:
+            copy_move_penalty = 25
+        elif copy_move_score > 0.3:
+            copy_move_penalty = 15
+        
+        # SCORE FINAL
+        final_score = max(0, base_score - jpeg_penalty - copy_move_penalty)
         
         integrated_results = {
             'v2_legitimate_elements': legitimate_elements,
             'v2_exclusion_mask': exclusion_mask,
             'v2_exclusion_percentage': exclusion_percentage,
-            'v2_1_lighting_analysis': lighting_result.to_dict() if lighting_result else None,
-            'v2_1_lighting_score_penalty': lighting_score_penalty,
-            'v2_2_edge_analysis': edge_result,
-            'v2_2_edge_score_penalty': edge_score_penalty,
+            'v2_5_jpeg_analysis': jpeg_analysis,
+            'v2_5_jpeg_penalty': jpeg_penalty,
+            'v2_5_copy_move_analysis': copy_move_analysis,
+            'v2_5_copy_move_penalty': copy_move_penalty,
             'v1_texture_analysis': texture_results,
             'base_texture_score': base_score,
             'final_score': final_score,
@@ -837,18 +671,13 @@ class IntegratedTextureAnalyzer:
         if self.debug:
             print(f"\nRESULTADO:")
             print(f"  Base: {base_score}")
-            print(f"  Luz: -{lighting_score_penalty}")
-            print(f"  Bordas: -{edge_score_penalty}")
+            print(f"  JPEG penalty: -{jpeg_penalty}")
+            print(f"  Copy-Move penalty: -{copy_move_penalty}")
             print(f"  FINAL: {final_score}")
-            print(f"  Categoria: {integrated_results['final_category'][0]}")
         
         return integrated_results
     
     def _analyze_texture_with_mask(self, image, exclusion_mask):
-        """
-        Análise de textura CORRIGIDA
-        Foco: detectar IA, ignorar uniformidade natural
-        """
         if len(image.shape) > 2:
             img_gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
         else:
@@ -865,13 +694,11 @@ class IntegratedTextureAnalyzer:
         variance_map = np.zeros((rows, cols))
         entropy_map = np.zeros((rows, cols))
         exclusion_map = np.zeros((rows, cols))
-        uniformity_map = np.zeros((rows, cols))  # NOVO
         
         for i in range(0, height - self.block_size + 1, self.block_size):
             for j in range(0, width - self.block_size + 1, self.block_size):
                 block_lbp = lbp_image[i:i+self.block_size, j:j+self.block_size]
                 block_mask = exclusion_mask_resized[i:i+self.block_size, j:j+self.block_size]
-                block_gray = img_gray[i:i+self.block_size, j:j+self.block_size]
                 
                 row_idx = i // self.block_size
                 col_idx = j // self.block_size
@@ -882,9 +709,7 @@ class IntegratedTextureAnalyzer:
                     exclusion_map[row_idx, col_idx] = 1
                     variance_map[row_idx, col_idx] = 1.0
                     entropy_map[row_idx, col_idx] = 1.0
-                    uniformity_map[row_idx, col_idx] = 0
                 else:
-                    # Calcular entropia LBP
                     hist, _ = np.histogram(block_lbp, bins=10, range=(0, 10))
                     hist = hist.astype("float")
                     hist /= (hist.sum() + 1e-7)
@@ -892,38 +717,16 @@ class IntegratedTextureAnalyzer:
                     max_entropy = np.log(10)
                     norm_entropy = block_entropy / max_entropy if max_entropy > 0 else 0
                     
-                    # Calcular variância LBP
                     block_variance = np.var(block_lbp) / 255.0
-                    
-                    # NOVO: Detectar uniformidade NATURAL (etiquetas, papéis)
-                    # vs uniformidade ARTIFICIAL (IA)
-                    gray_std = np.std(block_gray)
-                    gray_mean = np.mean(block_gray)
-                    
-                    # Etiquetas: STD muito baixo + brightness alto
-                    is_natural_uniform = (gray_std < 10 and gray_mean > 150)
                     
                     if row_idx < rows and col_idx < cols:
                         variance_map[row_idx, col_idx] = block_variance
                         entropy_map[row_idx, col_idx] = norm_entropy
-                        uniformity_map[row_idx, col_idx] = 1.0 if is_natural_uniform else 0.0
         
-        # Calcular naturalness COM correção de uniformidade
-        # Áreas naturalmente uniformes (etiquetas) recebem score ALTO
-        naturalness_map = np.where(
-            uniformity_map > 0.5,
-            1.0,  # Uniformidade natural = score máximo
-            entropy_map * 0.7 + variance_map * 0.3  # Score normal
-        )
-        
+        naturalness_map = entropy_map * 0.7 + variance_map * 0.3
         norm_naturalness_map = cv2.normalize(naturalness_map, None, 0, 1, cv2.NORM_MINMAX)
         
-        # Áreas suspeitas: baixa naturalidade E NÃO é uniformidade natural
-        suspicious_mask = (
-            (norm_naturalness_map < self.threshold) & 
-            (exclusion_map == 0) &
-            (uniformity_map < 0.5)  # NOVO: ignorar uniformidade natural
-        )
+        suspicious_mask = (norm_naturalness_map < self.threshold) & (exclusion_map == 0)
         
         valid_blocks = exclusion_map == 0
         if np.sum(valid_blocks) > 0:
@@ -947,7 +750,11 @@ class IntegratedTextureAnalyzer:
         }
     
     def _classify_naturalness(self, score):
-        if score <= 45:
+        if score == 0:
+            return "Erro de análise", "Score zero - Revisar imagem manualmente"
+        elif score <= 15:
+            return "Análise inconclusiva", "Score muito baixo - Possível detecção excessiva ou imagem muito manipulada"
+        elif score <= 45:
             return "Alta chance de manipulação", "Textura artificial detectada"
         elif score <= 70:
             return "Textura suspeita", "Revisão manual sugerida"
@@ -990,23 +797,6 @@ class IntegratedTextureAnalyzer:
                 x, y, w, h = cv2.boundingRect(contour)
                 cv2.rectangle(highlighted, (x, y), (x+w, y+h), (0, 255, 0), 2)
         
-        lighting_analysis = integrated_results.get('v2_1_lighting_analysis')
-        if lighting_analysis and lighting_analysis['suspicious_regions_count'] > 0:
-            for x, y, w, h in lighting_analysis['suspicious_regions']:
-                cv2.rectangle(highlighted, (x, y), (x+w, y+h), (0, 165, 255), 2)
-        
-        edge_analysis = integrated_results.get('v2_2_edge_analysis')
-        if edge_analysis and edge_analysis['artificial_edge_mask'] is not None:
-            artificial_edge_mask = edge_analysis['artificial_edge_mask']
-            artificial_resized = cv2.resize(artificial_edge_mask, (width, height), interpolation=cv2.INTER_NEAREST)
-            
-            edge_contours, _ = cv2.findContours(artificial_resized, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            for contour in edge_contours:
-                area = cv2.contourArea(contour)
-                if area > 200:
-                    x, y, w, h = cv2.boundingRect(contour)
-                    cv2.rectangle(highlighted, (x, y), (x+w, y+h), (255, 255, 0), 2)
-        
         category, _ = integrated_results['final_category']
         
         font = cv2.FONT_HERSHEY_SIMPLEX
@@ -1022,15 +812,15 @@ class IntegratedTextureAnalyzer:
                    (10, y_offset), font, 0.6, (0, 255, 0), 2)
         y_offset += 30
         
-        lighting_penalty = integrated_results.get('v2_1_lighting_score_penalty', 0)
-        if lighting_penalty > 0:
-            cv2.putText(highlighted, f"Luz: -{lighting_penalty}pts", 
-                       (10, y_offset), font, 0.6, (0, 165, 255), 2)
+        jpeg_penalty = integrated_results.get('v2_5_jpeg_penalty', 0)
+        if jpeg_penalty > 0:
+            cv2.putText(highlighted, f"JPEG: -{jpeg_penalty}pts", 
+                       (10, y_offset), font, 0.6, (255, 0, 0), 2)
             y_offset += 30
         
-        edge_penalty = integrated_results.get('v2_2_edge_score_penalty', 0)
-        if edge_penalty > 0:
-            cv2.putText(highlighted, f"Bordas: -{edge_penalty}pts", 
-                       (10, y_offset), font, 0.6, (255, 255, 0), 2)
+        copy_move_penalty = integrated_results.get('v2_5_copy_move_penalty', 0)
+        if copy_move_penalty > 0:
+            cv2.putText(highlighted, f"Clone: -{copy_move_penalty}pts", 
+                       (10, y_offset), font, 0.6, (0, 0, 255), 2)
         
         return highlighted, heatmap
