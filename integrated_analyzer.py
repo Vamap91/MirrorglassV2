@@ -1,9 +1,7 @@
 # integrated_analyzer.py
 """
-MirrorGlass V2.5 - ABORDAGEM CIENTÍFICA
-Baseado em papers validados:
-1. JPEG Artifact Analysis (Farid, 2009)
-2. Copy-Move Detection (Fridrich, 2003)
+MirrorGlass V2.5 - CALIBRADO
+Baseado em papers validados com PENALIDADES AJUSTADAS
 """
 
 import cv2
@@ -26,43 +24,16 @@ class RegionInfo:
     metadata: Dict = None
 
 
-@dataclass
-class LightingAnalysisResult:
-    """Resultados da análise de iluminação"""
-    inconsistency_mask: np.ndarray
-    inconsistency_score: float
-    shadow_map: np.ndarray
-    highlight_map: np.ndarray
-    lighting_direction_map: np.ndarray
-    suspicious_regions: List[Tuple[int, int, int, int]]
-    metadata: Dict
-    
-    def to_dict(self):
-        return {
-            'inconsistency_score': float(self.inconsistency_score),
-            'suspicious_regions_count': len(self.suspicious_regions),
-            'suspicious_regions': self.suspicious_regions,
-            'metadata': self.metadata
-        }
-
-
 class JPEGArtifactAnalyzer:
     """
-    Detector 1: Análise de Artefatos JPEG
-    Baseado em: Farid, H. (2009) "Exposing Digital Forgeries From JPEG Ghosts"
-    
-    Princípio: IAs geram imagens com padrões JPEG inconsistentes
+    Detector 1: Análise de Artefatos JPEG (CALIBRADO)
     """
     
     def __init__(self, debug=False):
         self.debug = debug
     
     def analyze_jpeg_artifacts(self, image: np.ndarray) -> Dict:
-        """
-        Analisa inconsistências em artefatos JPEG
-        
-        IAs criam padrões de compressão diferentes de câmeras reais
-        """
+        """Analisa inconsistências em artefatos JPEG"""
         if self.debug:
             print("\n--- Análise de Artefatos JPEG ---")
         
@@ -96,16 +67,10 @@ class JPEGArtifactAnalyzer:
         }
     
     def _analyze_dct_blocks(self, image: np.ndarray) -> float:
-        """
-        Analisa blocos DCT 8x8
-        
-        Câmeras reais: blocos alinhados perfeitamente
-        IA: blocos podem ter desalinhamento sutil
-        """
+        """Analisa blocos DCT 8x8"""
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         h, w = gray.shape
         
-        # Análise em múltiplos offsets (0,0), (4,0), (0,4), (4,4)
         inconsistency_scores = []
         
         for offset_y in [0, 4]:
@@ -115,55 +80,41 @@ class JPEGArtifactAnalyzer:
                 for i in range(offset_y, h - 8, 8):
                     for j in range(offset_x, w - 8, 8):
                         block = gray[i:i+8, j:j+8].astype(np.float64)
-                        
-                        # DCT do bloco
                         dct_block = dct(dct(block.T, norm='ortho').T, norm='ortho')
-                        
-                        # Analisar coeficientes de alta frequência
                         high_freq = dct_block[4:, 4:]
                         variance = np.var(high_freq)
                         block_variance.append(variance)
                 
                 if block_variance:
-                    # Calcular inconsistência entre blocos
                     variance_array = np.array(block_variance)
-                    
-                    # IA tende a ter variância muito uniforme
                     variance_of_variance = np.var(variance_array)
                     mean_variance = np.mean(variance_array)
                     
                     if mean_variance > 0:
                         cv_variance = variance_of_variance / (mean_variance + 1e-7)
                         
-                        # Coeficiente de variação baixo = suspeito
-                        if cv_variance < 0.1:
-                            inconsistency_scores.append(0.8)
-                        elif cv_variance < 0.2:
-                            inconsistency_scores.append(0.6)
-                        elif cv_variance < 0.3:
-                            inconsistency_scores.append(0.4)
+                        # CALIBRADO: Menos agressivo
+                        if cv_variance < 0.05:
+                            inconsistency_scores.append(0.9)
+                        elif cv_variance < 0.08:
+                            inconsistency_scores.append(0.7)
+                        elif cv_variance < 0.12:
+                            inconsistency_scores.append(0.5)
+                        elif cv_variance < 0.20:
+                            inconsistency_scores.append(0.3)
                         else:
-                            inconsistency_scores.append(0.2)
+                            inconsistency_scores.append(0.1)
         
         return np.mean(inconsistency_scores) if inconsistency_scores else 0.0
     
     def _analyze_quantization_patterns(self, image: np.ndarray) -> float:
-        """
-        Analisa padrões de quantização JPEG
-        
-        IAs têm padrões de quantização diferentes de câmeras
-        """
+        """Analisa padrões de quantização JPEG"""
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         
-        # Calcular histograma de valores
         hist, bins = np.histogram(gray.flatten(), bins=256, range=(0, 256))
-        
-        # Detectar periodicidade no histograma (artefato de quantização)
-        # FFT do histograma
         hist_fft = np.fft.fft(hist)
-        power_spectrum = np.abs(hist_fft[1:128])  # Ignorar DC
+        power_spectrum = np.abs(hist_fft[1:128])
         
-        # Detectar picos periódicos
         peaks = []
         for i in range(1, len(power_spectrum) - 1):
             if power_spectrum[i] > power_spectrum[i-1] and power_spectrum[i] > power_spectrum[i+1]:
@@ -171,55 +122,44 @@ class JPEGArtifactAnalyzer:
                     peaks.append(power_spectrum[i])
         
         if len(peaks) > 0:
-            # Muitos picos = quantização artificial
             peak_strength = np.mean(peaks) / (np.mean(power_spectrum) + 1e-7)
             
-            if peak_strength > 5:
-                return 0.8
+            # CALIBRADO: Threshold muito mais alto
+            if peak_strength > 10:
+                return 0.9
+            elif peak_strength > 7:
+                return 0.7
+            elif peak_strength > 5:
+                return 0.5
             elif peak_strength > 3:
-                return 0.6
-            elif peak_strength > 2:
-                return 0.4
+                return 0.3
             else:
-                return 0.2
+                return 0.1
         
         return 0.0
     
     def _detect_double_jpeg(self, image: np.ndarray) -> float:
-        """
-        Detecta double JPEG compression
-        
-        IA gera imagem, salva JPEG, edita, salva novamente = double JPEG
-        """
+        """Detecta double JPEG compression"""
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         h, w = gray.shape
         
-        # Analisar blocos 8x8 para detectar double quantization
         double_jpeg_indicators = []
         
         for i in range(0, h - 8, 8):
             for j in range(0, w - 8, 8):
                 block = gray[i:i+8, j:j+8].astype(np.float64)
-                
-                # DCT
                 dct_block = dct(dct(block.T, norm='ortho').T, norm='ortho')
-                
-                # Analisar distribuição de coeficientes
                 coeffs_flat = dct_block.flatten()
-                
-                # Histograma de coeficientes
                 hist, _ = np.histogram(coeffs_flat, bins=50)
                 
-                # Double JPEG tem "vales" no histograma
-                # Detectar padrão de vales
                 valleys = 0
                 for k in range(1, len(hist) - 1):
                     if hist[k] < hist[k-1] and hist[k] < hist[k+1]:
                         if hist[k-1] > 0 and hist[k+1] > 0:
                             valleys += 1
                 
-                # Muitos vales = double JPEG
-                if valleys > 5:
+                # CALIBRADO: Threshold mais alto
+                if valleys > 8:
                     double_jpeg_indicators.append(1)
                 else:
                     double_jpeg_indicators.append(0)
@@ -227,73 +167,59 @@ class JPEGArtifactAnalyzer:
         if double_jpeg_indicators:
             double_jpeg_ratio = np.mean(double_jpeg_indicators)
             
-            if double_jpeg_ratio > 0.3:
-                return 0.8
+            # CALIBRADO: Menos sensível
+            if double_jpeg_ratio > 0.5:
+                return 0.9
+            elif double_jpeg_ratio > 0.4:
+                return 0.7
+            elif double_jpeg_ratio > 0.3:
+                return 0.5
             elif double_jpeg_ratio > 0.2:
-                return 0.6
-            elif double_jpeg_ratio > 0.1:
-                return 0.4
+                return 0.3
             else:
-                return 0.2
+                return 0.1
         
         return 0.0
 
 
 class CopyMoveDetector:
     """
-    Detector 2: Detecção de Copy-Move (Clonagem)
-    Baseado em: Fridrich et al. (2003) "Detection of Copy-Move Forgery in Digital Images"
-    
-    Princípio: IAs de inpainting copiam/colam texturas de outras partes
+    Detector 2: Detecção de Copy-Move (CALIBRADO)
     """
     
     def __init__(self, debug=False):
         self.debug = debug
     
     def detect_copy_move(self, image: np.ndarray) -> Dict:
-        """
-        Detecta regiões clonadas/copiadas
-        
-        Método: Block matching com DCT
-        """
+        """Detecta regiões clonadas/copiadas"""
         if self.debug:
             print("\n--- Detecção de Copy-Move ---")
         
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         h, w = gray.shape
         
-        # Parâmetros calibrados
         block_size = 16
-        threshold_similarity = 0.95  # Similaridade muito alta = suspeito
+        threshold_similarity = 0.97  # ERA 0.95, AGORA mais rigoroso
         
-        # Extrair blocos sobrepostos
         blocks = []
         positions = []
         
-        step = block_size // 2  # Overlap de 50%
+        step = block_size // 2
         
         for i in range(0, h - block_size, step):
             for j in range(0, w - block_size, step):
                 block = gray[i:i+block_size, j:j+block_size]
-                
-                # DCT do bloco para invariância a pequenas mudanças
                 dct_block = dct(dct(block.T, norm='ortho').T, norm='ortho')
-                
-                # Usar apenas coeficientes de baixa frequência (mais robustos)
                 features = dct_block[:8, :8].flatten()
-                
                 blocks.append(features)
                 positions.append((i, j))
         
         blocks = np.array(blocks)
-        
-        # Encontrar blocos similares
         similar_pairs = []
         n_blocks = len(blocks)
         
         for i in range(n_blocks):
             for j in range(i + 1, n_blocks):
-                # Calcular distância euclidiana normalizada
                 dist = np.linalg.norm(blocks[i] - blocks[j])
                 norm = np.linalg.norm(blocks[i]) + np.linalg.norm(blocks[j])
                 
@@ -301,19 +227,15 @@ class CopyMoveDetector:
                     similarity = 1 - (dist / norm)
                     
                     if similarity > threshold_similarity:
-                        # Verificar se blocos não são adjacentes
                         pos_i = positions[i]
                         pos_j = positions[j]
-                        
                         distance = np.sqrt((pos_i[0] - pos_j[0])**2 + (pos_i[1] - pos_j[1])**2)
                         
-                        # Só considerar se estão longe (não adjacentes)
-                        if distance > block_size * 3:
+                        # CALIBRADO: Distância mínima aumentada
+                        if distance > block_size * 4:  # ERA 3, AGORA 4
                             similar_pairs.append((i, j, similarity, distance))
         
-        # Analisar pares similares
         if len(similar_pairs) > 0:
-            # Agrupar pares em clusters
             copy_move_score = self._analyze_similar_pairs(similar_pairs, n_blocks)
         else:
             copy_move_score = 0.0
@@ -329,39 +251,34 @@ class CopyMoveDetector:
         }
     
     def _analyze_similar_pairs(self, similar_pairs: List, total_blocks: int) -> float:
-        """
-        Analisa pares similares para determinar se há clonagem
-        """
+        """Analisa pares similares (CALIBRADO)"""
         if not similar_pairs:
             return 0.0
         
-        # Calcular ratio de blocos envolvidos em clonagem
         unique_blocks = set()
         for pair in similar_pairs:
             unique_blocks.add(pair[0])
             unique_blocks.add(pair[1])
         
         cloned_ratio = len(unique_blocks) / total_blocks
-        
-        # Analisar padrão de similaridades
         similarities = [pair[2] for pair in similar_pairs]
         avg_similarity = np.mean(similarities)
         
-        # Score baseado em ratio e similaridade
-        if cloned_ratio > 0.15 and avg_similarity > 0.98:
+        # CALIBRADO: Thresholds muito mais altos
+        if cloned_ratio > 0.25 and avg_similarity > 0.99:
             return 0.9
-        elif cloned_ratio > 0.1 and avg_similarity > 0.97:
+        elif cloned_ratio > 0.20 and avg_similarity > 0.985:
             return 0.75
-        elif cloned_ratio > 0.05 and avg_similarity > 0.96:
+        elif cloned_ratio > 0.15 and avg_similarity > 0.98:
             return 0.6
-        elif cloned_ratio > 0.03:
+        elif cloned_ratio > 0.10 and avg_similarity > 0.975:
             return 0.4
         else:
             return 0.2
 
 
 class LegitimateElementDetector:
-    """Detecta elementos legítimos (mantido do código anterior)"""
+    """Detecta elementos legítimos"""
     
     def __init__(self, debug=False):
         self.debug = debug
@@ -533,13 +450,15 @@ class LegitimateElementDetector:
         return None
     
     def _detect_glass_reflections(self, image: np.ndarray) -> Optional[RegionInfo]:
+        """CALIBRADO: Threshold aumentado de 5% para 15%"""
         hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
         h, w = image.shape[:2]
         
         h_channel, s_channel, v_channel = cv2.split(hsv)
         
-        low_saturation = s_channel < 50
-        high_value = v_channel > 200
+        # CALIBRADO: Mais rigoroso
+        low_saturation = s_channel < 40  # ERA 50
+        high_value = v_channel > 215     # ERA 200
         potential_reflections = (low_saturation & high_value).astype(np.uint8) * 255
         
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
@@ -560,7 +479,8 @@ class LegitimateElementDetector:
         total_area = h * w
         reflection_ratio = reflection_area / total_area
         
-        if reflection_ratio > 0.05:
+        # CALIBRADO: 15% em vez de 5%
+        if reflection_ratio > 0.15:
             contours, _ = cv2.findContours(reflection_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             if contours:
                 x, y, w_c, h_c = cv2.boundingRect(np.vstack(contours))
@@ -590,10 +510,7 @@ class LegitimateElementDetector:
 
 
 class IntegratedTextureAnalyzer:
-    """
-    Analisador V2.5 - CIENTÍFICO
-    Combina detectores validados cientificamente
-    """
+    """Analisador V2.5 CALIBRADO"""
     
     def __init__(self, P=8, R=1, block_size=20, threshold=0.50, debug=False):
         self.P = P
@@ -606,9 +523,9 @@ class IntegratedTextureAnalyzer:
         self.copy_move_detector = CopyMoveDetector(debug=debug)
     
     def analyze_image_integrated(self, image):
-        """Análise integrada V2.5 CIENTÍFICA"""
+        """Análise integrada V2.5 CALIBRADA"""
         if self.debug:
-            print("\n=== ANÁLISE V2.5 CIENTÍFICA ===")
+            print("\n=== ANÁLISE V2.5 CALIBRADA ===")
         
         # FASE 1: Elementos legítimos
         legitimate_elements = self.legitimate_detector.detect_all(image)
@@ -619,36 +536,36 @@ class IntegratedTextureAnalyzer:
         excluded_pixels = np.sum(exclusion_mask == 255)
         exclusion_percentage = (excluded_pixels / total_pixels) * 100
         
-        # FASE 2: Análise JPEG (validada cientificamente)
+        # FASE 2: Análise JPEG
         jpeg_analysis = self.jpeg_analyzer.analyze_jpeg_artifacts(image)
         jpeg_score = jpeg_analysis['jpeg_artifact_score']
         
-        # FASE 3: Detecção Copy-Move (validada cientificamente)
+        # FASE 3: Detecção Copy-Move
         copy_move_analysis = self.copy_move_detector.detect_copy_move(image)
         copy_move_score = copy_move_analysis['copy_move_score']
         
-        # FASE 4: Textura LBP (baseline)
+        # FASE 4: Textura LBP
         texture_results = self._analyze_texture_with_mask(image, exclusion_mask)
         base_score = texture_results['naturalness_score']
         
-        # PENALIDADES CALIBRADAS CIENTIFICAMENTE
+        # PENALIDADES RECALIBRADAS (MUITO MENOS AGRESSIVAS)
         jpeg_penalty = 0
-        if jpeg_score > 0.7:
-            jpeg_penalty = 40
-        elif jpeg_score > 0.5:
-            jpeg_penalty = 30
-        elif jpeg_score > 0.3:
-            jpeg_penalty = 20
-        elif jpeg_score > 0.15:
-            jpeg_penalty = 10
+        if jpeg_score > 0.85:       # ERA 0.7
+            jpeg_penalty = 25       # ERA 40
+        elif jpeg_score > 0.75:     # ERA 0.5
+            jpeg_penalty = 18       # ERA 30
+        elif jpeg_score > 0.65:     # ERA 0.3
+            jpeg_penalty = 12       # ERA 20
+        elif jpeg_score > 0.50:     # ERA 0.15
+            jpeg_penalty = 6        # ERA 10
         
         copy_move_penalty = 0
-        if copy_move_score > 0.7:
-            copy_move_penalty = 35
-        elif copy_move_score > 0.5:
-            copy_move_penalty = 25
-        elif copy_move_score > 0.3:
-            copy_move_penalty = 15
+        if copy_move_score > 0.85:  # ERA 0.7
+            copy_move_penalty = 20  # ERA 35
+        elif copy_move_score > 0.75: # ERA 0.5
+            copy_move_penalty = 15  # ERA 25
+        elif copy_move_score > 0.60: # ERA 0.3
+            copy_move_penalty = 8   # ERA 15
         
         # SCORE FINAL
         final_score = max(0, base_score - jpeg_penalty - copy_move_penalty)
@@ -670,9 +587,9 @@ class IntegratedTextureAnalyzer:
         
         if self.debug:
             print(f"\nRESULTADO:")
-            print(f"  Base: {base_score}")
-            print(f"  JPEG penalty: -{jpeg_penalty}")
-            print(f"  Copy-Move penalty: -{copy_move_penalty}")
+            print(f"  Base LBP: {base_score}")
+            print(f"  JPEG penalty: -{jpeg_penalty} (score: {jpeg_score:.2%})")
+            print(f"  Copy-Move penalty: -{copy_move_penalty} (score: {copy_move_score:.2%})")
             print(f"  FINAL: {final_score}")
         
         return integrated_results
@@ -750,16 +667,17 @@ class IntegratedTextureAnalyzer:
         }
     
     def _classify_naturalness(self, score):
-        if score == 0:
-            return "Erro de análise", "Score zero - Revisar imagem manualmente"
-        elif score <= 15:
-            return "Análise inconclusiva", "Score muito baixo - Possível detecção excessiva ou imagem muito manipulada"
-        elif score <= 45:
-            return "Alta chance de manipulação", "Textura artificial detectada"
-        elif score <= 70:
-            return "Textura suspeita", "Revisão manual sugerida"
+        """CLASSIFICAÇÃO RECALIBRADA"""
+        if score >= 75:
+            return "Textura natural", "Baixa chance de manipulação por IA"
+        elif score >= 55:
+            return "Textura suspeita", "Revisão manual recomendada - possível edição menor"
+        elif score >= 35:
+            return "Provável manipulação", "Alta probabilidade de edição por IA"
+        elif score >= 15:
+            return "Manipulação detectada", "Textura artificial forte - imagem editada"
         else:
-            return "Textura natural", "Baixa chance de manipulação"
+            return "Análise inconclusiva", "Score muito baixo - verificar qualidade da imagem"
     
     def generate_visual_report(self, image, integrated_results):
         if len(image.shape) == 2:
