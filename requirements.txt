@@ -1,25 +1,8 @@
-# MirrorGlass V2.5 - Requirements
-# Otimizado para Streamlit Cloud
-
-# Core Web Framework
-streamlit==1.28.0
-
-# Computação Numérica
-numpy==1.24.3
-
-# Processamento de Imagens
-pillow==10.1.0
-
-# Visão Computacional (HEADLESS para Streamlit Cloud)
-opencv-python-headless==4.8.1.78
-scikit-image==0.22.0
-
-# OCR (Detecção de Texto)
-pytesseract==0.3.10
-
-# Análise de Dados
-pandas==2.1.3
-scipy==1.11.4
-
-# Visualização
-matplotlib==3.8.2
+streamlit==1.24.0
+numpy==1.23.5
+pillow==9.5.0
+matplotlib==3.7.1
+pandas==2.0.3
+scikit-learn==1.2.2
+scikit-image==0.20.0
+opencv-python-headless==4.8.0.74
