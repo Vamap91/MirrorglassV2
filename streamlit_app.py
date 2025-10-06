@@ -25,7 +25,7 @@ st.set_page_config(
 )
 
 # Título e introdução
-st.title("📊 Mirror Glass: Sistema de Detecção de Fraudes em Imagens")
+st.title("📊 Mirror Glass V2: Sistema de Detecção de Fraudes em Imagens")
 st.markdown("""
 Este sistema utiliza técnicas avançadas de visão computacional para:
 1. **Detectar imagens duplicadas** ou altamente semelhantes, mesmo com alterações como cortes ou ajustes
