@@ -18,7 +18,7 @@ from sklearn.cluster import KMeans
 
 # Configuração da página Streamlit
 st.set_page_config(
-    page_title="Mirror Glass - Detector de Fraudes em Imagens",
+    page_title="MirrorGlass V2 - Detector de Fraudes em Imagens",
     page_icon="🔍",
     layout="wide",
     initial_sidebar_state="expanded"
