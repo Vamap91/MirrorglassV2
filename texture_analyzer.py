@@ -246,6 +246,295 @@ class TextureAnalyzer:
         
         return report
 
+
+class EdgeAnalyzer:
+    """
+    Classe para análise de bordas e detecção de transições artificiais.
+    Complementa o TextureAnalyzer detectando áreas manipuladas através de 
+    inconsistências nas bordas e gradientes.
+    """
+    
+    def __init__(self, block_size=16, edge_threshold_low=50, edge_threshold_high=150):
+        """
+        Inicializa o analisador de bordas.
+        
+        Args:
+            block_size: Tamanho dos blocos para análise local (pixels)
+            edge_threshold_low: Limiar inferior para detecção Canny
+            edge_threshold_high: Limiar superior para detecção Canny
+        """
+        self.block_size = block_size
+        self.edge_threshold_low = edge_threshold_low
+        self.edge_threshold_high = edge_threshold_high
+    
+    def _convert_to_gray(self, image):
+        """Converte imagem para escala de cinza."""
+        if isinstance(image, Image.Image):
+            return np.array(image.convert('L'))
+        elif len(image.shape) > 2:
+            return cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        else:
+            return image
+    
+    def detect_edges(self, image):
+        """
+        Detecta bordas usando algoritmo Canny.
+        
+        Args:
+            image: Imagem (PIL ou numpy)
+            
+        Returns:
+            Mapa de bordas binário
+        """
+        gray = self._convert_to_gray(image)
+        
+        # Aplicar desfoque gaussiano para reduzir ruído
+        blurred = cv2.GaussianBlur(gray, (5, 5), 1.4)
+        
+        # Detecção de bordas com Canny
+        edges = cv2.Canny(blurred, self.edge_threshold_low, self.edge_threshold_high)
+        
+        return edges
+    
+    def compute_gradients(self, image):
+        """
+        Calcula magnitude e direção dos gradientes.
+        
+        Args:
+            image: Imagem (PIL ou numpy)
+            
+        Returns:
+            Dict com magnitude e direção dos gradientes
+        """
+        gray = self._convert_to_gray(image)
+        
+        # Calcular gradientes usando Sobel
+        gradient_x = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
+        gradient_y = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
+        
+        # Magnitude do gradiente
+        magnitude = np.sqrt(gradient_x**2 + gradient_y**2)
+        
+        # Direção do gradiente (em radianos)
+        direction = np.arctan2(gradient_y, gradient_x)
+        
+        # Normalizar magnitude para visualização
+        magnitude_normalized = cv2.normalize(magnitude, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+        
+        return {
+            "magnitude": magnitude,
+            "magnitude_normalized": magnitude_normalized,
+            "direction": direction,
+            "gradient_x": gradient_x,
+            "gradient_y": gradient_y
+        }
+    
+    def analyze_edge_coherence(self, image):
+        """
+        Analisa a coerência espacial das bordas.
+        Bordas naturais tendem a ser mais coerentes que bordas artificiais.
+        
+        Args:
+            image: Imagem (PIL ou numpy)
+            
+        Returns:
+            Dict com mapa de coerência e score
+        """
+        # Converter para numpy se necessário
+        if isinstance(image, Image.Image):
+            image = np.array(image)
+        
+        gray = self._convert_to_gray(image)
+        height, width = gray.shape
+        
+        # Calcular gradientes
+        gradients = self.compute_gradients(image)
+        magnitude = gradients["magnitude"]
+        direction = gradients["direction"]
+        
+        # Dividir em blocos
+        rows = max(1, height // self.block_size)
+        cols = max(1, width // self.block_size)
+        
+        coherence_map = np.zeros((rows, cols))
+        edge_density_map = np.zeros((rows, cols))
+        
+        for i in range(0, height - self.block_size + 1, self.block_size):
+            for j in range(0, width - self.block_size + 1, self.block_size):
+                # Extrair bloco
+                block_mag = magnitude[i:i+self.block_size, j:j+self.block_size]
+                block_dir = direction[i:i+self.block_size, j:j+self.block_size]
+                
+                row_idx = i // self.block_size
+                col_idx = j // self.block_size
+                
+                if row_idx >= rows or col_idx >= cols:
+                    continue
+                
+                # Calcular densidade de bordas (magnitude média)
+                edge_density = np.mean(block_mag) / 255.0
+                edge_density_map[row_idx, col_idx] = edge_density
+                
+                # Calcular coerência de direção
+                # Bordas coerentes têm direções similares
+                if np.sum(block_mag > 10) > 10:  # Se houver bordas significativas
+                    # Usar apenas pixels com magnitude significativa
+                    significant_pixels = block_mag > np.percentile(block_mag, 70)
+                    if np.any(significant_pixels):
+                        directions_sig = block_dir[significant_pixels]
+                        
+                        # Calcular desvio padrão circular das direções
+                        # Menor desvio = maior coerência
+                        mean_cos = np.mean(np.cos(directions_sig))
+                        mean_sin = np.mean(np.sin(directions_sig))
+                        circular_variance = 1 - np.sqrt(mean_cos**2 + mean_sin**2)
+                        
+                        coherence_map[row_idx, col_idx] = 1 - circular_variance
+                    else:
+                        coherence_map[row_idx, col_idx] = 0.5
+                else:
+                    coherence_map[row_idx, col_idx] = 0.5  # Neutro para áreas sem bordas
+        
+        # Normalizar mapas
+        coherence_normalized = cv2.normalize(coherence_map, None, 0, 1, cv2.NORM_MINMAX)
+        edge_density_normalized = cv2.normalize(edge_density_map, None, 0, 1, cv2.NORM_MINMAX)
+        
+        # Calcular score geral de naturalidade das bordas
+        # Combinação: 60% coerência + 40% densidade
+        edge_naturalness = coherence_normalized * 0.6 + edge_density_normalized * 0.4
+        
+        # Score final (0-100)
+        edge_score = int(np.mean(edge_naturalness) * 100)
+        
+        return {
+            "coherence_map": coherence_normalized,
+            "edge_density_map": edge_density_normalized,
+            "edge_naturalness_map": edge_naturalness,
+            "edge_score": edge_score
+        }
+    
+    def detect_artificial_transitions(self, image):
+        """
+        Detecta transições artificiais que podem indicar manipulação.
+        
+        Args:
+            image: Imagem (PIL ou numpy)
+            
+        Returns:
+            Máscara de áreas com transições suspeitas
+        """
+        gray = self._convert_to_gray(image)
+        
+        # Detectar bordas
+        edges = self.detect_edges(image)
+        
+        # Calcular gradientes
+        gradients = self.compute_gradients(image)
+        magnitude = gradients["magnitude_normalized"]
+        
+        # Detectar transições abruptas
+        # Usar filtro Laplaciano para detectar mudanças bruscas
+        laplacian = cv2.Laplacian(gray, cv2.CV_64F)
+        laplacian_abs = np.abs(laplacian)
+        
+        # Normalizar
+        laplacian_norm = cv2.normalize(laplacian_abs, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+        
+        # Threshold para detectar transições muito abruptas (suspeitas)
+        _, suspicious_transitions = cv2.threshold(laplacian_norm, 180, 255, cv2.THRESH_BINARY)
+        
+        # Aplicar morfologia para limpar ruído
+        kernel = np.ones((3, 3), np.uint8)
+        suspicious_transitions = cv2.morphologyEx(suspicious_transitions, cv2.MORPH_CLOSE, kernel)
+        suspicious_transitions = cv2.morphologyEx(suspicious_transitions, cv2.MORPH_OPEN, kernel)
+        
+        return suspicious_transitions
+    
+    def generate_edge_visualization(self, image, analysis_results):
+        """
+        Gera visualização das análises de borda.
+        
+        Args:
+            image: Imagem original
+            analysis_results: Resultados da análise de bordas
+            
+        Returns:
+            Imagem com visualização das bordas e áreas suspeitas
+        """
+        # Converter para numpy RGB
+        if isinstance(image, Image.Image):
+            image = np.array(image.convert('RGB'))
+        
+        height, width = image.shape[:2]
+        
+        # Redimensionar mapas para tamanho original
+        edge_naturalness = analysis_results["edge_naturalness_map"]
+        edge_naturalness_resized = cv2.resize(edge_naturalness, (width, height), 
+                                             interpolation=cv2.INTER_LINEAR)
+        
+        # Criar mapa de calor
+        heatmap = cv2.applyColorMap((edge_naturalness_resized * 255).astype(np.uint8), 
+                                    cv2.COLORMAP_JET)
+        
+        # Overlay
+        overlay = cv2.addWeighted(image, 0.6, heatmap, 0.4, 0)
+        
+        # Adicionar informações
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        score = analysis_results["edge_score"]
+        cv2.putText(overlay, f"Edge Score: {score}/100", (10, 90), font, 0.7, (255, 255, 255), 2)
+        
+        return overlay, heatmap
+    
+    def analyze_image(self, image):
+        """
+        Análise completa de bordas da imagem.
+        
+        Args:
+            image: Imagem a ser analisada
+            
+        Returns:
+            Dict com todos os resultados da análise de bordas
+        """
+        # Análise de coerência
+        coherence_results = self.analyze_edge_coherence(image)
+        
+        # Detecção de transições artificiais
+        suspicious_transitions = self.detect_artificial_transitions(image)
+        
+        # Calcular percentual de transições suspeitas
+        percent_suspicious_transitions = (np.sum(suspicious_transitions > 0) / 
+                                         suspicious_transitions.size * 100)
+        
+        # Visualização
+        visual_report, heatmap = self.generate_edge_visualization(image, coherence_results)
+        
+        # Score e classificação
+        edge_score = coherence_results["edge_score"]
+        
+        if edge_score <= 40:
+            category = "Bordas artificiais detectadas"
+            description = "Alta probabilidade de manipulação"
+        elif edge_score <= 65:
+            category = "Bordas suspeitas"
+            description = "Requer verificação manual"
+        else:
+            category = "Bordas naturais"
+            description = "Baixa probabilidade de manipulação"
+        
+        return {
+            "edge_score": edge_score,
+            "category": category,
+            "description": description,
+            "percent_suspicious_transitions": percent_suspicious_transitions,
+            "visual_report": visual_report,
+            "heatmap": heatmap,
+            "coherence_map": coherence_results["coherence_map"],
+            "edge_density_map": coherence_results["edge_density_map"],
+            "suspicious_transitions": suspicious_transitions
+        }
+
+
 # Função auxiliar para integrar com o Mirror Glass
 def get_image_download_link(img, filename, text):
     """
