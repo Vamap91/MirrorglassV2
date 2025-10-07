@@ -990,10 +990,10 @@ class AdaptiveWeightAnalyzer:
         final_score = int(min(max(combined_score, 0), 100))
         
         # Classificar resultado final
-        if final_score <= 45:
+        if final_score <= 35:
             final_category = "Alta chance de manipulação"
             final_description = "Textura artificial detectada"
-        elif final_score <= 65:
+        elif final_score <= 50:
             final_category = "Textura suspeita"
             final_description = "Revisão manual sugerida"
         else:
