@@ -17,7 +17,7 @@ class TextureAnalyzer:
     Detecta manipulações em imagens automotivas, principalmente restaurações por IA.
     """
     
-    def __init__(self, P=8, R=1, block_size=16, threshold=0.3):
+    def __init__(self, P=8, R=1, block_size=16, threshold=0.50):
         """
         Inicializa o analisador de textura.
         
@@ -117,7 +117,7 @@ class TextureAnalyzer:
                     entropy_map[row_idx, col_idx] = norm_entropy
         
         # Combina entropia e variância para pontuação de naturalidade (70% entropia, 30% variância)
-        naturalness_map = entropy_map * 0.7 + variance_map * 0.3
+        naturalness_map = entropy_map * 0.5 + variance_map * 0.5
         
         # Normaliza o mapa para visualização
         norm_naturalness_map = cv2.normalize(naturalness_map, None, 0, 1, cv2.NORM_MINMAX)
@@ -149,9 +149,9 @@ class TextureAnalyzer:
         Returns:
             Categoria e descrição
         """
-        if score <= 30:
+        if score <= 45:
             return "Alta chance de manipulação", "Textura artificial detectada"
-        elif score <= 70:
+        elif score <= 65:
             return "Textura suspeita", "Revisão manual sugerida"
         else:
             return "Textura natural", "Baixa chance de manipulação"
