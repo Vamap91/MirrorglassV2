@@ -118,9 +118,9 @@ class TextureAnalyzer:
     
     def classify_naturalness(self, score):
         """Classifica o score de naturalidade em categorias."""
-        if score <= 45:
+        if score <= 20:
             return "Alta chance de manipulação", "Textura artificial detectada"
-        elif score <= 65:
+        elif score <= 50:
             return "Textura suspeita", "Revisão manual sugerida"
         else:
             return "Textura natural", "Baixa chance de manipulação"
