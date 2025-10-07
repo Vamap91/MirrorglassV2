@@ -1,5 +1,4 @@
-# texture_analyzer.py
-# ✅ TextureAnalyzer (LBP) ✅ EdgeAnalyzer (Bordas) ✅ NoiseAnalyzer (Ruído)
+# ✅ TextureAnalyzer (LBP) ✅ EdgeAnalyzer (Bordas) ✅ NoiseAnalyzer (Ruído) ✅ LightingAnalyzer (Iluminação)
 import cv2
 import numpy as np
 from skimage.feature import local_binary_pattern
@@ -828,6 +827,404 @@ class NoiseAnalyzer:
             "noise_map": local_analysis["noise_map"],
             "suspicious_noise_mask": suspicious_mask,
             "hf_energy_map": hf_analysis["hf_energy_map"]
+        }
+
+
+class LightingAnalyzer:
+    """
+    Analisador de iluminação baseado em princípios físicos.
+    Detecta manipulações por IA através de inconsistências na física da luz:
+    reflexos, gradientes, sombras e consistência global.
+    """
+    
+    def __init__(self, reflection_weight=0.30, gradient_weight=0.30, 
+                 shadow_weight=0.20, global_weight=0.20):
+        """
+        Inicializa o analisador de iluminação.
+        
+        Args:
+            reflection_weight: Peso para análise de reflexos (0-1)
+            gradient_weight: Peso para análise de gradientes (0-1)
+            shadow_weight: Peso para análise de sombras (0-1)
+            global_weight: Peso para análise de consistência global (0-1)
+        """
+        self.reflection_weight = reflection_weight
+        self.gradient_weight = gradient_weight
+        self.shadow_weight = shadow_weight
+        self.global_weight = global_weight
+    
+    def _convert_to_gray(self, image):
+        """Converte imagem para escala de cinza."""
+        if isinstance(image, Image.Image):
+            return np.array(image.convert('L'))
+        elif len(image.shape) > 2:
+            return cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        else:
+            return image
+    
+    def analyze_specular_reflections(self, image):
+        """
+        Analisa reflexos especulares (highlights).
+        Reflexos naturais têm forma e distribuição específicas.
+        
+        Args:
+            image: Imagem (PIL ou numpy)
+            
+        Returns:
+            Dict com análise de reflexos e score
+        """
+        # Converter para numpy se necessário
+        if isinstance(image, Image.Image):
+            image = np.array(image)
+        
+        # Converter para HSV (melhor para análise de brilho)
+        if len(image.shape) == 2:
+            value_channel = image
+        else:
+            hsv = cv2.cvtColor(image, cv2.COLOR_RGB2HSV)
+            value_channel = hsv[:, :, 2]
+        
+        # Detectar highlights (pixels muito brilhantes)
+        _, highlights = cv2.threshold(value_channel, 200, 255, cv2.THRESH_BINARY)
+        
+        # Encontrar contornos dos reflexos
+        contours, _ = cv2.findContours(highlights, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        # Analisar forma dos reflexos
+        natural_reflections = 0
+        total_area = 0
+        
+        for contour in contours:
+            area = cv2.contourArea(contour)
+            
+            # Ignorar reflexos muito pequenos (ruído) ou muito grandes
+            if 50 < area < 5000:
+                perimeter = cv2.arcLength(contour, True)
+                
+                if perimeter > 0:
+                    # Calcular circularidade (0 = linha, 1 = círculo perfeito)
+                    circularity = 4 * np.pi * area / (perimeter ** 2)
+                    
+                    # Reflexos naturais tendem a ser elípticos/circulares
+                    if 0.4 < circularity < 1.0:
+                        natural_reflections += 1
+                        total_area += area
+        
+        # Score baseado em número e qualidade dos reflexos
+        reflection_score = min(natural_reflections * 5, 30)
+        
+        # Calcular percentual de área com reflexos
+        image_area = value_channel.shape[0] * value_channel.shape[1]
+        reflection_ratio = (total_area / image_area) * 100
+        
+        return {
+            "num_highlights": len(contours),
+            "natural_reflections": natural_reflections,
+            "reflection_ratio": reflection_ratio,
+            "score_adjustment": reflection_score
+        }
+    
+    def analyze_lighting_gradients(self, image):
+        """
+        Analisa gradientes de iluminação.
+        Iluminação natural tem gradientes suaves e direcionais.
+        
+        Args:
+            image: Imagem (PIL ou numpy)
+            
+        Returns:
+            Dict com análise de gradientes e score
+        """
+        gray = self._convert_to_gray(image)
+        
+        # Calcular gradientes usando Sobel (kernel maior para captar iluminação)
+        gradient_x = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=5)
+        gradient_y = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=5)
+        
+        magnitude = np.sqrt(gradient_x**2 + gradient_y**2)
+        direction = np.arctan2(gradient_y, gradient_x)
+        
+        # Analisar suavidade dos gradientes
+        # Segunda derivada (Laplaciano) para detectar mudanças bruscas
+        laplacian = cv2.Laplacian(gray, cv2.CV_64F, ksize=5)
+        smoothness = 1.0 / (np.std(laplacian) + 1)
+        
+        # Detectar direção dominante da luz
+        # Histograma circular de direções (36 bins = 10 graus cada)
+        direction_hist, _ = np.histogram(direction, bins=36, range=(-np.pi, np.pi))
+        
+        # Normalizar histograma
+        if np.sum(direction_hist) > 0:
+            direction_hist = direction_hist / np.sum(direction_hist)
+            direction_consistency = np.max(direction_hist)
+        else:
+            direction_consistency = 0
+        
+        # Validar transições
+        # Transições muito abruptas são suspeitas
+        abrupt_transitions = np.sum(magnitude > np.percentile(magnitude, 95))
+        abrupt_ratio = abrupt_transitions / magnitude.size
+        
+        # Score combinado
+        gradient_score = 0
+        
+        if smoothness > 0.05:  # Gradientes suaves
+            gradient_score += 10
+        
+        if direction_consistency > 0.15:  # Direção consistente
+            gradient_score += 10
+        
+        if abrupt_ratio < 0.05:  # Poucas transições abruptas
+            gradient_score += 10
+        
+        return {
+            "smoothness": smoothness,
+            "direction_consistency": direction_consistency,
+            "abrupt_ratio": abrupt_ratio,
+            "score_adjustment": gradient_score
+        }
+    
+    def analyze_shadows(self, image):
+        """
+        Analisa sombras para validar iluminação natural.
+        Sombras devem ter direção e intensidade consistentes.
+        
+        Args:
+            image: Imagem (PIL ou numpy)
+            
+        Returns:
+            Dict com análise de sombras e score
+        """
+        # Converter para numpy se necessário
+        if isinstance(image, Image.Image):
+            image = np.array(image)
+        
+        # Converter para LAB (melhor para luminância)
+        if len(image.shape) == 2:
+            l_channel = image
+        else:
+            lab = cv2.cvtColor(image, cv2.COLOR_RGB2LAB)
+            l_channel = lab[:, :, 0]
+        
+        # Detectar áreas escuras (possíveis sombras)
+        _, shadow_mask = cv2.threshold(l_channel, 60, 255, cv2.THRESH_BINARY_INV)
+        
+        # Analisar conectividade das sombras
+        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(shadow_mask)
+        
+        # Validar sombras
+        valid_shadows = 0
+        shadow_directions = []
+        
+        for i in range(1, num_labels):  # Ignorar background (0)
+            area = stats[i, cv2.CC_STAT_AREA]
+            
+            # Filtrar sombras por tamanho (muito pequenas = ruído, muito grandes = objeto escuro)
+            if 100 < area < 50000:
+                valid_shadows += 1
+                
+                # Calcular orientação da sombra
+                shadow_region = (labels == i).astype(np.uint8)
+                moments = cv2.moments(shadow_region)
+                
+                # Evitar divisão por zero
+                if moments['mu20'] != 0 and moments['mu02'] != 0:
+                    # Calcular ângulo principal
+                    angle = 0.5 * np.arctan2(2 * moments['mu11'], 
+                                            moments['mu20'] - moments['mu02'])
+                    shadow_directions.append(angle)
+        
+        # Verificar consistência de direção das sombras
+        if len(shadow_directions) > 1:
+            # Calcular variância circular
+            mean_cos = np.mean(np.cos(shadow_directions))
+            mean_sin = np.mean(np.sin(shadow_directions))
+            shadow_consistency = np.sqrt(mean_cos**2 + mean_sin**2)
+        else:
+            shadow_consistency = 0.5  # Neutro se poucas sombras
+        
+        # Score
+        shadow_score = 0
+        
+        if valid_shadows > 0:  # Tem sombras detectáveis
+            shadow_score += 10
+        
+        if shadow_consistency > 0.6:  # Direção consistente
+            shadow_score += 15
+        
+        return {
+            "num_shadows": valid_shadows,
+            "shadow_consistency": shadow_consistency,
+            "score_adjustment": shadow_score
+        }
+    
+    def analyze_global_consistency(self, image):
+        """
+        Analisa consistência global da iluminação.
+        Verifica se iluminação é uniforme em toda a imagem.
+        
+        Args:
+            image: Imagem (PIL ou numpy)
+            
+        Returns:
+            Dict com análise de consistência global e score
+        """
+        # Converter para numpy se necessário
+        if isinstance(image, Image.Image):
+            image = np.array(image)
+        
+        # Converter para LAB
+        if len(image.shape) == 2:
+            l_channel = image
+        else:
+            lab = cv2.cvtColor(image, cv2.COLOR_RGB2LAB)
+            l_channel = lab[:, :, 0]
+        
+        # Dividir imagem em quadrantes
+        h, w = l_channel.shape
+        quadrants = [
+            l_channel[0:h//2, 0:w//2],      # Superior esquerdo
+            l_channel[0:h//2, w//2:w],      # Superior direito
+            l_channel[h//2:h, 0:w//2],      # Inferior esquerdo
+            l_channel[h//2:h, w//2:w]       # Inferior direito
+        ]
+        
+        # Calcular luminância média de cada quadrante
+        quad_means = [np.mean(q) for q in quadrants]
+        
+        # Verificar consistência entre quadrantes
+        mean_luminance = np.mean(quad_means)
+        
+        if mean_luminance > 0:
+            max_deviation = np.max(np.abs(quad_means - mean_luminance))
+            consistency_ratio = 1.0 - (max_deviation / mean_luminance)
+        else:
+            consistency_ratio = 0.5
+        
+        # Analisar histograma de luminância
+        hist, _ = np.histogram(l_channel, bins=64, range=(0, 255))
+        hist = hist.astype(float) / (hist.sum() + 1e-7)
+        
+        # Entropia do histograma (distribuição de intensidades)
+        hist_entropy = entropy(hist + 1e-7)  # Evitar log(0)
+        
+        # Suavidade do histograma
+        hist_diff = np.diff(hist)
+        hist_smoothness = 1.0 - min(np.std(hist_diff), 1.0)
+        
+        # Score
+        global_score = 0
+        
+        if consistency_ratio > 0.75:  # Boa consistência entre quadrantes
+            global_score += 10
+        
+        if hist_entropy > 3.5:  # Boa distribuição de intensidades
+            global_score += 10
+        
+        if hist_smoothness > 0.7:  # Histograma suave
+            global_score += 10
+        
+        return {
+            "consistency_ratio": consistency_ratio,
+            "hist_entropy": hist_entropy,
+            "hist_smoothness": hist_smoothness,
+            "score_adjustment": global_score
+        }
+    
+    def generate_lighting_visualization(self, image, analysis_results):
+        """
+        Gera visualização da análise de iluminação.
+        
+        Args:
+            image: Imagem original
+            analysis_results: Resultados da análise de iluminação
+            
+        Returns:
+            Imagem com visualização da iluminação
+        """
+        # Converter para numpy RGB
+        if isinstance(image, Image.Image):
+            image = np.array(image.convert('RGB'))
+        
+        # Criar visualização simples com overlay de informações
+        visual = image.copy()
+        
+        # Adicionar informações na imagem
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        score = analysis_results["lighting_score"]
+        
+        cv2.putText(visual, f"Lighting Score: {score}/100", (10, 150), 
+                   font, 0.7, (255, 255, 255), 2)
+        
+        # Criar mapa de calor baseado em luminância
+        if len(image.shape) == 2:
+            gray = image
+        else:
+            gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+        
+        heatmap = cv2.applyColorMap(gray, cv2.COLORMAP_JET)
+        overlay = cv2.addWeighted(image, 0.7, heatmap, 0.3, 0)
+        
+        return visual, overlay
+    
+    def analyze_image(self, image):
+        """
+        Análise completa de iluminação da imagem.
+        
+        Args:
+            image: Imagem a ser analisada
+            
+        Returns:
+            Dict com todos os resultados da análise de iluminação
+        """
+        # Executar os 4 componentes de análise
+        reflections = self.analyze_specular_reflections(image)
+        gradients = self.analyze_lighting_gradients(image)
+        shadows = self.analyze_shadows(image)
+        global_consistency = self.analyze_global_consistency(image)
+        
+        # Calcular score ponderado
+        lighting_score = (
+            reflections["score_adjustment"] * self.reflection_weight +
+            gradients["score_adjustment"] * self.gradient_weight +
+            shadows["score_adjustment"] * self.shadow_weight +
+            global_consistency["score_adjustment"] * self.global_weight
+        )
+        
+        # Garantir que score está entre 0-100
+        lighting_score = int(min(max(lighting_score, 0), 100))
+        
+        # Classificação
+        if lighting_score >= 20:
+            category = "Iluminação natural"
+            description = "Física da luz consistente"
+        elif lighting_score >= 10:
+            category = "Iluminação aceitável"
+            description = "Algumas inconsistências menores"
+        else:
+            category = "Iluminação suspeita"
+            description = "Inconsistências físicas detectadas"
+        
+        # Preparar dados para visualização
+        visualization_data = {
+            "lighting_score": lighting_score
+        }
+        
+        # Gerar visualização
+        visual_report, heatmap = self.generate_lighting_visualization(image, visualization_data)
+        
+        return {
+            "lighting_score": lighting_score,
+            "category": category,
+            "description": description,
+            "visual_report": visual_report,
+            "heatmap": heatmap,
+            "components": {
+                "reflections": reflections,
+                "gradients": gradients,
+                "shadows": shadows,
+                "global": global_consistency
+            }
         }
 
 
