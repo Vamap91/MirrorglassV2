@@ -1,7 +1,9 @@
 # texture_analyzer.py
+# ✅ TextureAnalyzer (LBP) ✅ EdgeAnalyzer (Bordas) ✅ NoiseAnalyzer (Ruído)
 import cv2
 import numpy as np
 from skimage.feature import local_binary_pattern
+from skimage.restoration import estimate_sigma
 from scipy.stats import entropy
 import matplotlib.pyplot as plt
 from PIL import Image
@@ -532,6 +534,300 @@ class EdgeAnalyzer:
             "coherence_map": coherence_results["coherence_map"],
             "edge_density_map": coherence_results["edge_density_map"],
             "suspicious_transitions": suspicious_transitions
+        }
+
+
+class NoiseAnalyzer:
+    """
+    Classe para análise de padrões de ruído e detecção de inconsistências.
+    IAs generativas alteram ou removem o ruído natural do sensor da câmera,
+    deixando padrões inconsistentes detectáveis.
+    """
+    
+    def __init__(self, block_size=32, sigma_threshold=0.15):
+        """
+        Inicializa o analisador de ruído.
+        
+        Args:
+            block_size: Tamanho dos blocos para análise local (pixels)
+            sigma_threshold: Limiar para detectar variação suspeita de ruído (0-1)
+        """
+        self.block_size = block_size
+        self.sigma_threshold = sigma_threshold
+    
+    def _convert_to_gray(self, image):
+        """Converte imagem para escala de cinza."""
+        if isinstance(image, Image.Image):
+            return np.array(image.convert('L'))
+        elif len(image.shape) > 2:
+            return cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        else:
+            return image
+    
+    def estimate_noise_level(self, image):
+        """
+        Estima o nível de ruído da imagem completa.
+        
+        Args:
+            image: Imagem (PIL ou numpy)
+            
+        Returns:
+            Sigma estimado (desvio padrão do ruído)
+        """
+        gray = self._convert_to_gray(image)
+        
+        # Usar estimate_sigma do scikit-image
+        # average_sigmas=True para obter média dos canais
+        sigma = estimate_sigma(gray, average_sigmas=True, channel_axis=None)
+        
+        return sigma
+    
+    def analyze_local_noise(self, image):
+        """
+        Analisa o ruído localmente por blocos.
+        Áreas manipuladas terão ruído diferente das áreas originais.
+        
+        Args:
+            image: Imagem (PIL ou numpy)
+            
+        Returns:
+            Dict com mapa de ruído local e estatísticas
+        """
+        # Converter para numpy se necessário
+        if isinstance(image, Image.Image):
+            image = np.array(image)
+        
+        gray = self._convert_to_gray(image)
+        height, width = gray.shape
+        
+        # Dividir em blocos
+        rows = max(1, height // self.block_size)
+        cols = max(1, width // self.block_size)
+        
+        noise_map = np.zeros((rows, cols))
+        
+        for i in range(0, height - self.block_size + 1, self.block_size):
+            for j in range(0, width - self.block_size + 1, self.block_size):
+                block = gray[i:i+self.block_size, j:j+self.block_size]
+                
+                row_idx = i // self.block_size
+                col_idx = j // self.block_size
+                
+                if row_idx >= rows or col_idx >= cols:
+                    continue
+                
+                # Estimar ruído do bloco
+                try:
+                    block_sigma = estimate_sigma(block, average_sigmas=True, channel_axis=None)
+                    noise_map[row_idx, col_idx] = block_sigma
+                except:
+                    # Em caso de erro, usar desvio padrão simples
+                    noise_map[row_idx, col_idx] = np.std(block)
+        
+        # Normalizar mapa
+        noise_map_normalized = cv2.normalize(noise_map, None, 0, 1, cv2.NORM_MINMAX)
+        
+        return {
+            "noise_map": noise_map,
+            "noise_map_normalized": noise_map_normalized
+        }
+    
+    def detect_noise_inconsistencies(self, image):
+        """
+        Detecta inconsistências no padrão de ruído.
+        
+        Args:
+            image: Imagem (PIL ou numpy)
+            
+        Returns:
+            Dict com análise de inconsistências
+        """
+        # Estimar ruído global
+        global_noise = self.estimate_noise_level(image)
+        
+        # Analisar ruído local
+        local_analysis = self.analyze_local_noise(image)
+        noise_map = local_analysis["noise_map"]
+        
+        # Calcular média e desvio padrão do ruído local
+        noise_mean = np.mean(noise_map)
+        noise_std = np.std(noise_map)
+        
+        # Calcular coeficiente de variação (CV)
+        # CV alto = inconsistência suspeita
+        if noise_mean > 0:
+            noise_cv = noise_std / noise_mean
+        else:
+            noise_cv = 0
+        
+        # Detectar blocos com ruído muito diferente da média
+        # Blocos "limpos demais" ou "ruidosos demais"
+        noise_deviation = np.abs(noise_map - noise_mean) / (noise_std + 1e-7)
+        
+        # Máscara de áreas suspeitas (desvio > 2 sigmas)
+        suspicious_noise_mask = noise_deviation > 2.0
+        
+        # Calcular score de consistência de ruído (0-100)
+        # Menor CV = mais consistente = mais natural
+        # Normalizar CV para score
+        noise_consistency_score = int(max(0, min(100, 100 - (noise_cv * 200))))
+        
+        return {
+            "global_noise": global_noise,
+            "noise_mean": noise_mean,
+            "noise_std": noise_std,
+            "noise_cv": noise_cv,
+            "noise_deviation_map": noise_deviation,
+            "suspicious_noise_mask": suspicious_noise_mask,
+            "noise_consistency_score": noise_consistency_score
+        }
+    
+    def analyze_high_frequency_noise(self, image):
+        """
+        Analisa componentes de alta frequência (ruído fino).
+        IAs tendem a suavizar ou criar ruído artificial.
+        
+        Args:
+            image: Imagem (PIL ou numpy)
+            
+        Returns:
+            Dict com análise de alta frequência
+        """
+        gray = self._convert_to_gray(image)
+        
+        # Aplicar filtro passa-alta para isolar ruído
+        # Usar Laplaciano como filtro passa-alta
+        laplacian = cv2.Laplacian(gray.astype(np.float32), cv2.CV_64F, ksize=3)
+        
+        # Calcular energia de alta frequência por bloco
+        height, width = gray.shape
+        rows = max(1, height // self.block_size)
+        cols = max(1, width // self.block_size)
+        
+        hf_energy_map = np.zeros((rows, cols))
+        
+        for i in range(0, height - self.block_size + 1, self.block_size):
+            for j in range(0, width - self.block_size + 1, self.block_size):
+                block_hf = laplacian[i:i+self.block_size, j:j+self.block_size]
+                
+                row_idx = i // self.block_size
+                col_idx = j // self.block_size
+                
+                if row_idx >= rows or col_idx >= cols:
+                    continue
+                
+                # Energia = soma dos quadrados
+                hf_energy = np.sum(block_hf ** 2)
+                hf_energy_map[row_idx, col_idx] = hf_energy
+        
+        # Normalizar
+        hf_energy_normalized = cv2.normalize(hf_energy_map, None, 0, 1, cv2.NORM_MINMAX)
+        
+        # Calcular uniformidade da energia
+        hf_uniformity = 1.0 - np.std(hf_energy_normalized)
+        
+        return {
+            "hf_energy_map": hf_energy_map,
+            "hf_energy_normalized": hf_energy_normalized,
+            "hf_uniformity": hf_uniformity
+        }
+    
+    def generate_noise_visualization(self, image, analysis_results):
+        """
+        Gera visualização da análise de ruído.
+        
+        Args:
+            image: Imagem original
+            analysis_results: Resultados da análise de ruído
+            
+        Returns:
+            Imagem com visualização do ruído
+        """
+        # Converter para numpy RGB
+        if isinstance(image, Image.Image):
+            image = np.array(image.convert('RGB'))
+        
+        height, width = image.shape[:2]
+        
+        # Redimensionar mapa de ruído
+        noise_map_normalized = analysis_results["noise_map_normalized"]
+        noise_map_resized = cv2.resize(noise_map_normalized, (width, height), 
+                                      interpolation=cv2.INTER_LINEAR)
+        
+        # Criar mapa de calor
+        heatmap = cv2.applyColorMap((noise_map_resized * 255).astype(np.uint8), 
+                                    cv2.COLORMAP_JET)
+        
+        # Overlay
+        overlay = cv2.addWeighted(image, 0.6, heatmap, 0.4, 0)
+        
+        # Adicionar informações
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        score = analysis_results["noise_consistency_score"]
+        cv2.putText(overlay, f"Noise Score: {score}/100", (10, 120), font, 0.7, (255, 255, 255), 2)
+        
+        return overlay, heatmap
+    
+    def analyze_image(self, image):
+        """
+        Análise completa de ruído da imagem.
+        
+        Args:
+            image: Imagem a ser analisada
+            
+        Returns:
+            Dict com todos os resultados da análise de ruído
+        """
+        # Análise de ruído local
+        local_analysis = self.analyze_local_noise(image)
+        
+        # Detecção de inconsistências
+        inconsistency_results = self.detect_noise_inconsistencies(image)
+        
+        # Análise de alta frequência
+        hf_analysis = self.analyze_high_frequency_noise(image)
+        
+        # Combinar resultados
+        noise_map_normalized = local_analysis["noise_map_normalized"]
+        
+        # Calcular percentual de áreas suspeitas
+        suspicious_mask = inconsistency_results["suspicious_noise_mask"]
+        percent_suspicious_noise = float(np.mean(suspicious_mask) * 100)
+        
+        # Preparar para visualização
+        visualization_data = {
+            "noise_map_normalized": noise_map_normalized,
+            "noise_consistency_score": inconsistency_results["noise_consistency_score"]
+        }
+        
+        # Visualização
+        visual_report, heatmap = self.generate_noise_visualization(image, visualization_data)
+        
+        # Score e classificação
+        noise_score = inconsistency_results["noise_consistency_score"]
+        
+        if noise_score <= 40:
+            category = "Padrão de ruído artificial"
+            description = "Alta probabilidade de manipulação"
+        elif noise_score <= 65:
+            category = "Ruído inconsistente"
+            description = "Requer verificação manual"
+        else:
+            category = "Ruído natural e consistente"
+            description = "Baixa probabilidade de manipulação"
+        
+        return {
+            "noise_score": noise_score,
+            "category": category,
+            "description": description,
+            "percent_suspicious_noise": percent_suspicious_noise,
+            "global_noise": inconsistency_results["global_noise"],
+            "noise_cv": inconsistency_results["noise_cv"],
+            "visual_report": visual_report,
+            "heatmap": heatmap,
+            "noise_map": local_analysis["noise_map"],
+            "suspicious_noise_mask": suspicious_mask,
+            "hf_energy_map": hf_analysis["hf_energy_map"]
         }
 
 
