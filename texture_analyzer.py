@@ -13,22 +13,22 @@ import base64
 
 
 class TextureAnalyzer:
-    """Análise de texturas usando LBP com suporte a CLAHE."""
+    """Análise de texturas usando LBP com suporte a CLAHE e lógica de detecção aprimorada."""
     
     def __init__(self, P=8, R=1, block_size=16, threshold=0.50, 
                  use_clahe=True, clahe_clip_limit=2.0, clahe_tile_size=8):
         self.P = P
         self.R = R
         self.block_size = block_size
-        self.threshold = threshold
+        self.threshold = threshold # Mantido por compatibilidade, mas a detecção principal é adaptativa
         self.use_clahe = use_clahe
         self.clahe_clip_limit = clahe_clip_limit
         self.clahe_tile_size = clahe_tile_size
     
     def apply_clahe(self, img_gray):
+        """Aplica o pré-processamento CLAHE se estiver ativado."""
         if not self.use_clahe:
             return img_gray
-        # Garantir que a imagem seja uint8
         if img_gray.dtype != np.uint8:
             img_gray = np.clip(img_gray, 0, 255).astype(np.uint8)
         clahe = cv2.createCLAHE(clipLimit=self.clahe_clip_limit,
@@ -36,6 +36,7 @@ class TextureAnalyzer:
         return clahe.apply(img_gray)
     
     def calculate_lbp(self, image):
+        """Converte a imagem para escala de cinza, aplica CLAHE e calcula o LBP."""
         if isinstance(image, Image.Image):
             img_gray = np.array(image.convert('L'))
         elif len(image.shape) > 2:
@@ -46,11 +47,7 @@ class TextureAnalyzer:
         img_gray = self.apply_clahe(img_gray)
         lbp = local_binary_pattern(img_gray, self.P, self.R, method="uniform")
         
-        n_bins = self.P + 2
-        hist, _ = np.histogram(lbp.ravel(), bins=n_bins, range=(0, n_bins))
-        hist = hist.astype("float") / (hist.sum() + 1e-7)
-        
-        return lbp, hist
+        return lbp, img_gray
     
 # Em texture_analyzer.py, dentro da classe TextureAnalyzer
 
