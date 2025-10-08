@@ -903,6 +903,7 @@ class UnifiedAnalyzer:
             "score": final_score,
             "category": category,
             "description": description,
+            "percent_suspicious": texture_result['percent_suspicious'],
             "weights_used": weights,
             "clahe_enabled": self.use_clahe,
             "individual_scores": {
@@ -1046,6 +1047,7 @@ class UnifiedAnalyzer:
             "score": final_score,
             "category": category,
             "description": description,
+            "percent_suspicious": texture_result['percent_suspicious'],
             "detection_type": detection_type,
             "reasoning": reasoning,
             "weights_used": weights,
