@@ -1,6 +1,6 @@
 # texture_analyzer.py
 # Sistema Unificado de Análise de Imagens com CLAHE
-# Versão: 3.0.0 - Janeiro 2025
+# Versão: 3.0.1 - Outubro 2025 (FIX: OpenCV type compatibility)
 
 import cv2
 import numpy as np
@@ -28,6 +28,9 @@ class TextureAnalyzer:
     def apply_clahe(self, img_gray):
         if not self.use_clahe:
             return img_gray
+        # Garantir que a imagem seja uint8
+        if img_gray.dtype != np.uint8:
+            img_gray = np.clip(img_gray, 0, 255).astype(np.uint8)
         clahe = cv2.createCLAHE(clipLimit=self.clahe_clip_limit,
                                 tileGridSize=(self.clahe_tile_size, self.clahe_tile_size))
         return clahe.apply(img_gray)
@@ -38,7 +41,7 @@ class TextureAnalyzer:
         elif len(image.shape) > 2:
             img_gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         else:
-            img_gray = image
+            img_gray = image.copy()
         
         img_gray = self.apply_clahe(img_gray)
         lbp = local_binary_pattern(img_gray, self.P, self.R, method="uniform")
@@ -171,6 +174,8 @@ class EdgeAnalyzer:
     def apply_clahe(self, img_gray):
         if not self.use_clahe:
             return img_gray
+        if img_gray.dtype != np.uint8:
+            img_gray = np.clip(img_gray, 0, 255).astype(np.uint8)
         clahe = cv2.createCLAHE(clipLimit=self.clahe_clip_limit,
                                 tileGridSize=(self.clahe_tile_size, self.clahe_tile_size))
         return clahe.apply(img_gray)
@@ -181,7 +186,7 @@ class EdgeAnalyzer:
         elif len(image.shape) > 2:
             gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         else:
-            gray = image
+            gray = image.copy()
         return self.apply_clahe(gray)
     
     def detect_edges(self, image):
@@ -343,6 +348,8 @@ class NoiseAnalyzer:
     def apply_clahe(self, img_gray):
         if not self.use_clahe:
             return img_gray
+        if img_gray.dtype != np.uint8:
+            img_gray = np.clip(img_gray, 0, 255).astype(np.uint8)
         clahe = cv2.createCLAHE(clipLimit=self.clahe_clip_limit,
                                 tileGridSize=(self.clahe_tile_size, self.clahe_tile_size))
         return clahe.apply(img_gray)
@@ -353,7 +360,7 @@ class NoiseAnalyzer:
         elif len(image.shape) > 2:
             gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         else:
-            gray = image
+            gray = image.copy()
         return self.apply_clahe(gray)
     
     def estimate_noise_level(self, image):
@@ -423,8 +430,15 @@ class NoiseAnalyzer:
         }
     
     def analyze_high_frequency_noise(self, image):
+        # FIX: Garantir que a imagem seja uint8 antes de aplicar Laplacian
         gray = self._convert_to_gray(image)
-        laplacian = cv2.Laplacian(gray.astype(np.float32), cv2.CV_64F, ksize=3)
+        
+        # Converter para uint8 se necessário
+        if gray.dtype != np.uint8:
+            gray = np.clip(gray, 0, 255).astype(np.uint8)
+        
+        # Aplicar Laplacian com tipos compatíveis
+        laplacian = cv2.Laplacian(gray, cv2.CV_64F, ksize=3)
         
         height, width = gray.shape
         rows = max(1, height // self.block_size)
@@ -532,6 +546,8 @@ class LightingAnalyzer:
     def apply_clahe(self, img_gray):
         if not self.use_clahe:
             return img_gray
+        if img_gray.dtype != np.uint8:
+            img_gray = np.clip(img_gray, 0, 255).astype(np.uint8)
         clahe = cv2.createCLAHE(clipLimit=self.clahe_clip_limit,
                                 tileGridSize=(self.clahe_tile_size, self.clahe_tile_size))
         return clahe.apply(img_gray)
@@ -542,7 +558,7 @@ class LightingAnalyzer:
         elif len(image.shape) > 2:
             gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         else:
-            gray = image
+            gray = image.copy()
         return self.apply_clahe(gray)
     
     def analyze_specular_reflections(self, image):
@@ -942,6 +958,10 @@ class UnifiedAnalyzer:
             gray = image
         else:
             gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+        
+        # Garantir uint8
+        if gray.dtype != np.uint8:
+            gray = np.clip(gray, 0, 255).astype(np.uint8)
         
         kernel_size = 15
         mean = cv2.blur(gray.astype(np.float32), (kernel_size, kernel_size))
