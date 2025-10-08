@@ -1,79 +1,59 @@
 # texture_analyzer.py
-# ✅ TextureAnalyzer (LBP) ✅ EdgeAnalyzer (Bordas) ✅ NoiseAnalyzer (Ruído) 
-# ✅ LightingAnalyzer (Iluminação) ✅ AdaptiveWeightAnalyzer (Pesos Adaptativos)
+# Sistema Unificado de Análise de Imagens com CLAHE
+# Versão: 3.0.0 - Janeiro 2025
+
 import cv2
 import numpy as np
 from skimage.feature import local_binary_pattern
 from skimage.restoration import estimate_sigma
 from scipy.stats import entropy
-import matplotlib.pyplot as plt
 from PIL import Image
 import io
-import time
 import base64
 
+
 class TextureAnalyzer:
-    """
-    Classe para análise de texturas usando Local Binary Pattern (LBP).
-    Detecta manipulações em imagens automotivas, principalmente restaurações por IA.
-    """
+    """Análise de texturas usando LBP com suporte a CLAHE."""
     
-    def __init__(self, P=8, R=1, block_size=16, threshold=0.50):
-        """
-        Inicializa o analisador de textura.
-        
-        Args:
-            P: Número de pontos vizinhos para o LBP
-            R: Raio para o LBP
-            block_size: Tamanho dos blocos para análise local (pixels)
-            threshold: Limiar para considerar baixa variância (0-1)
-        """
+    def __init__(self, P=8, R=1, block_size=16, threshold=0.50, 
+                 use_clahe=True, clahe_clip_limit=2.0, clahe_tile_size=8):
         self.P = P
         self.R = R
         self.block_size = block_size
         self.threshold = threshold
+        self.use_clahe = use_clahe
+        self.clahe_clip_limit = clahe_clip_limit
+        self.clahe_tile_size = clahe_tile_size
+    
+    def apply_clahe(self, img_gray):
+        if not self.use_clahe:
+            return img_gray
+        clahe = cv2.createCLAHE(clipLimit=self.clahe_clip_limit,
+                                tileGridSize=(self.clahe_tile_size, self.clahe_tile_size))
+        return clahe.apply(img_gray)
     
     def calculate_lbp(self, image):
-        """
-        Calcula o padrão binário local (LBP) da imagem.
-        
-        Args:
-            image: Imagem (array numpy ou imagem PIL)
-            
-        Returns:
-            Imagem LBP e histograma de padrões
-        """
         if isinstance(image, Image.Image):
             img_gray = np.array(image.convert('L'))
         elif len(image.shape) > 2:
             img_gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         else:
             img_gray = image
-            
+        
+        img_gray = self.apply_clahe(img_gray)
         lbp = local_binary_pattern(img_gray, self.P, self.R, method="uniform")
         
         n_bins = self.P + 2
         hist, _ = np.histogram(lbp.ravel(), bins=n_bins, range=(0, n_bins))
-        hist = hist.astype("float")
-        hist /= (hist.sum() + 1e-7)
+        hist = hist.astype("float") / (hist.sum() + 1e-7)
         
         return lbp, hist
     
     def analyze_texture_variance(self, image):
-        """
-        Analisa a variância local das texturas e identifica áreas com baixa entropia.
-        
-        Args:
-            image: Imagem (PIL ou array numpy)
-            
-        Returns:
-            Dict contendo mapas de análise e score
-        """
         if isinstance(image, Image.Image):
             image = np.array(image)
         
         lbp_image, _ = self.calculate_lbp(image)
-        
         height, width = lbp_image.shape
         rows = max(1, height // self.block_size)
         cols = max(1, width // self.block_size)
@@ -86,13 +66,11 @@ class TextureAnalyzer:
                 block = lbp_image[i:i+self.block_size, j:j+self.block_size]
                 
                 hist, _ = np.histogram(block, bins=10, range=(0, 10))
-                hist = hist.astype("float")
-                hist /= (hist.sum() + 1e-7)
+                hist = hist.astype("float") / (hist.sum() + 1e-7)
                 block_entropy = entropy(hist)
                 
                 max_entropy = np.log(10)
                 norm_entropy = block_entropy / max_entropy if max_entropy > 0 else 0
-                
                 block_variance = np.var(block) / 255.0
                 
                 row_idx = i // self.block_size
@@ -117,7 +95,6 @@ class TextureAnalyzer:
         }
     
     def classify_naturalness(self, score):
-        """Classifica o score de naturalidade em categorias."""
         if score <= 35:
             return "Alta chance de manipulação", "Textura artificial detectada"
         elif score <= 55:
@@ -126,7 +103,6 @@ class TextureAnalyzer:
             return "Textura natural", "Baixa chance de manipulação"
     
     def generate_visual_report(self, image, analysis_results):
-        """Gera relatório visual com áreas suspeitas destacadas."""
         if isinstance(image, Image.Image):
             image = np.array(image.convert('RGB'))
         
@@ -135,7 +111,6 @@ class TextureAnalyzer:
         score = analysis_results["naturalness_score"]
         
         height, width = image.shape[:2]
-        
         naturalness_map_resized = cv2.resize(naturalness_map, (width, height), 
                                            interpolation=cv2.INTER_LINEAR)
         mask_resized = cv2.resize(suspicious_mask.astype(np.uint8), (width, height), 
@@ -156,10 +131,12 @@ class TextureAnalyzer:
         cv2.putText(highlighted, f"Score: {score}/100", (10, 30), font, 0.7, (255, 255, 255), 2)
         cv2.putText(highlighted, category, (10, 60), font, 0.7, (255, 255, 255), 2)
         
+        if self.use_clahe:
+            cv2.putText(highlighted, "CLAHE: ON", (10, 90), font, 0.5, (0, 255, 0), 1)
+        
         return highlighted, heatmap
     
     def analyze_image(self, image):
-        """Função completa para analisar a textura de uma imagem."""
         analysis_results = self.analyze_texture_variance(image)
         visual_report, heatmap = self.generate_visual_report(image, analysis_results)
         
@@ -174,27 +151,38 @@ class TextureAnalyzer:
             "percent_suspicious": percent_suspicious,
             "visual_report": visual_report,
             "heatmap": heatmap,
-            "analysis_results": analysis_results
+            "analysis_results": analysis_results,
+            "clahe_enabled": self.use_clahe
         }
 
 
 class EdgeAnalyzer:
-    """
-    Classe para análise de bordas e detecção de transições artificiais.
-    """
+    """Análise de bordas com suporte a CLAHE."""
     
-    def __init__(self, block_size=16, edge_threshold_low=50, edge_threshold_high=150):
+    def __init__(self, block_size=16, edge_threshold_low=50, edge_threshold_high=150,
+                 use_clahe=True, clahe_clip_limit=2.0, clahe_tile_size=8):
         self.block_size = block_size
         self.edge_threshold_low = edge_threshold_low
         self.edge_threshold_high = edge_threshold_high
+        self.use_clahe = use_clahe
+        self.clahe_clip_limit = clahe_clip_limit
+        self.clahe_tile_size = clahe_tile_size
+    
+    def apply_clahe(self, img_gray):
+        if not self.use_clahe:
+            return img_gray
+        clahe = cv2.createCLAHE(clipLimit=self.clahe_clip_limit,
+                                tileGridSize=(self.clahe_tile_size, self.clahe_tile_size))
+        return clahe.apply(img_gray)
     
     def _convert_to_gray(self, image):
         if isinstance(image, Image.Image):
-            return np.array(image.convert('L'))
+            gray = np.array(image.convert('L'))
         elif len(image.shape) > 2:
-            return cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         else:
-            return image
+            gray = image
+        return self.apply_clahe(gray)
     
     def detect_edges(self, image):
         gray = self._convert_to_gray(image)
@@ -276,10 +264,6 @@ class EdgeAnalyzer:
     
     def detect_artificial_transitions(self, image):
         gray = self._convert_to_gray(image)
-        edges = self.detect_edges(image)
-        gradients = self.compute_gradients(image)
-        magnitude = gradients["magnitude_normalized"]
-        
         laplacian = cv2.Laplacian(gray, cv2.CV_64F)
         laplacian_abs = np.abs(laplacian)
         laplacian_norm = cv2.normalize(laplacian_abs, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
@@ -340,26 +324,37 @@ class EdgeAnalyzer:
             "heatmap": heatmap,
             "coherence_map": coherence_results["coherence_map"],
             "edge_density_map": coherence_results["edge_density_map"],
-            "suspicious_transitions": suspicious_transitions
+            "suspicious_transitions": suspicious_transitions,
+            "clahe_enabled": self.use_clahe
         }
 
 
 class NoiseAnalyzer:
-    """
-    Classe para análise de padrões de ruído e detecção de inconsistências.
-    """
+    """Análise de ruído com suporte a CLAHE."""
     
-    def __init__(self, block_size=32, sigma_threshold=0.15):
+    def __init__(self, block_size=32, sigma_threshold=0.15,
+                 use_clahe=True, clahe_clip_limit=2.0, clahe_tile_size=8):
         self.block_size = block_size
         self.sigma_threshold = sigma_threshold
+        self.use_clahe = use_clahe
+        self.clahe_clip_limit = clahe_clip_limit
+        self.clahe_tile_size = clahe_tile_size
+    
+    def apply_clahe(self, img_gray):
+        if not self.use_clahe:
+            return img_gray
+        clahe = cv2.createCLAHE(clipLimit=self.clahe_clip_limit,
+                                tileGridSize=(self.clahe_tile_size, self.clahe_tile_size))
+        return clahe.apply(img_gray)
     
     def _convert_to_gray(self, image):
         if isinstance(image, Image.Image):
-            return np.array(image.convert('L'))
+            gray = np.array(image.convert('L'))
         elif len(image.shape) > 2:
-            return cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         else:
-            return image
+            gray = image
+        return self.apply_clahe(gray)
     
     def estimate_noise_level(self, image):
         gray = self._convert_to_gray(image)
@@ -515,39 +510,51 @@ class NoiseAnalyzer:
             "heatmap": heatmap,
             "noise_map": local_analysis["noise_map"],
             "suspicious_noise_mask": suspicious_mask,
-            "hf_energy_map": hf_analysis["hf_energy_map"]
+            "hf_energy_map": hf_analysis["hf_energy_map"],
+            "clahe_enabled": self.use_clahe
         }
 
 
 class LightingAnalyzer:
-    """
-    Analisador de iluminação baseado em princípios físicos.
-    """
+    """Analisador de iluminação com suporte a CLAHE."""
     
     def __init__(self, reflection_weight=0.30, gradient_weight=0.30, 
-                 shadow_weight=0.20, global_weight=0.20):
+                 shadow_weight=0.20, global_weight=0.20,
+                 use_clahe=True, clahe_clip_limit=2.0, clahe_tile_size=8):
         self.reflection_weight = reflection_weight
         self.gradient_weight = gradient_weight
         self.shadow_weight = shadow_weight
         self.global_weight = global_weight
+        self.use_clahe = use_clahe
+        self.clahe_clip_limit = clahe_clip_limit
+        self.clahe_tile_size = clahe_tile_size
+    
+    def apply_clahe(self, img_gray):
+        if not self.use_clahe:
+            return img_gray
+        clahe = cv2.createCLAHE(clipLimit=self.clahe_clip_limit,
+                                tileGridSize=(self.clahe_tile_size, self.clahe_tile_size))
+        return clahe.apply(img_gray)
     
     def _convert_to_gray(self, image):
         if isinstance(image, Image.Image):
-            return np.array(image.convert('L'))
+            gray = np.array(image.convert('L'))
         elif len(image.shape) > 2:
-            return cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         else:
-            return image
+            gray = image
+        return self.apply_clahe(gray)
     
     def analyze_specular_reflections(self, image):
         if isinstance(image, Image.Image):
             image = np.array(image)
         
         if len(image.shape) == 2:
-            value_channel = image
+            value_channel = self.apply_clahe(image)
         else:
             hsv = cv2.cvtColor(image, cv2.COLOR_RGB2HSV)
             value_channel = hsv[:, :, 2]
+            value_channel = self.apply_clahe(value_channel)
         
         _, highlights = cv2.threshold(value_channel, 200, 255, cv2.THRESH_BINARY)
         contours, _ = cv2.findContours(highlights, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -557,13 +564,10 @@ class LightingAnalyzer:
         
         for contour in contours:
             area = cv2.contourArea(contour)
-            
             if 50 < area < 5000:
                 perimeter = cv2.arcLength(contour, True)
-                
                 if perimeter > 0:
                     circularity = 4 * np.pi * area / (perimeter ** 2)
-                    
                     if 0.4 < circularity < 1.0:
                         natural_reflections += 1
                         total_area += area
@@ -584,7 +588,6 @@ class LightingAnalyzer:
         
         gradient_x = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=5)
         gradient_y = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=5)
-        
         magnitude = np.sqrt(gradient_x**2 + gradient_y**2)
         direction = np.arctan2(gradient_y, gradient_x)
         
@@ -592,7 +595,6 @@ class LightingAnalyzer:
         smoothness = 1.0 / (np.std(laplacian) + 1)
         
         direction_hist, _ = np.histogram(direction, bins=36, range=(-np.pi, np.pi))
-        
         if np.sum(direction_hist) > 0:
             direction_hist = direction_hist / np.sum(direction_hist)
             direction_consistency = np.max(direction_hist)
@@ -603,13 +605,10 @@ class LightingAnalyzer:
         abrupt_ratio = abrupt_transitions / magnitude.size
         
         gradient_score = 0
-        
         if smoothness > 0.05:
             gradient_score += 10
-        
         if direction_consistency > 0.15:
             gradient_score += 10
-        
         if abrupt_ratio < 0.05:
             gradient_score += 10
         
@@ -625,10 +624,11 @@ class LightingAnalyzer:
             image = np.array(image)
         
         if len(image.shape) == 2:
-            l_channel = image
+            l_channel = self.apply_clahe(image)
         else:
             lab = cv2.cvtColor(image, cv2.COLOR_RGB2LAB)
             l_channel = lab[:, :, 0]
+            l_channel = self.apply_clahe(l_channel)
         
         _, shadow_mask = cv2.threshold(l_channel, 60, 255, cv2.THRESH_BINARY_INV)
         num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(shadow_mask)
@@ -658,10 +658,8 @@ class LightingAnalyzer:
             shadow_consistency = 0.5
         
         shadow_score = 0
-        
         if valid_shadows > 0:
             shadow_score += 10
-        
         if shadow_consistency > 0.6:
             shadow_score += 15
         
@@ -676,10 +674,11 @@ class LightingAnalyzer:
             image = np.array(image)
         
         if len(image.shape) == 2:
-            l_channel = image
+            l_channel = self.apply_clahe(image)
         else:
             lab = cv2.cvtColor(image, cv2.COLOR_RGB2LAB)
             l_channel = lab[:, :, 0]
+            l_channel = self.apply_clahe(l_channel)
         
         h, w = l_channel.shape
         quadrants = [
@@ -706,13 +705,10 @@ class LightingAnalyzer:
         hist_smoothness = 1.0 - min(np.std(hist_diff), 1.0)
         
         global_score = 0
-        
         if consistency_ratio > 0.75:
             global_score += 10
-        
         if hist_entropy > 3.5:
             global_score += 10
-        
         if hist_smoothness > 0.7:
             global_score += 10
         
@@ -769,10 +765,7 @@ class LightingAnalyzer:
             category = "Iluminação suspeita"
             description = "Inconsistências físicas detectadas"
         
-        visualization_data = {
-            "lighting_score": lighting_score
-        }
-        
+        visualization_data = {"lighting_score": lighting_score}
         visual_report, heatmap = self.generate_lighting_visualization(image, visualization_data)
         
         return {
@@ -786,62 +779,150 @@ class LightingAnalyzer:
                 "gradients": gradients,
                 "shadows": shadows,
                 "global": global_consistency
-            }
+            },
+            "clahe_enabled": self.use_clahe
         }
 
 
-class AdaptiveWeightAnalyzer:
-    """
-    Sistema de análise com pesos adaptativos.
-    Ajusta automaticamente os pesos das análises baseado nas características da imagem.
-    Resolve falsos positivos em superfícies reflexivas (vidro, lataria).
-    """
+class UnifiedAnalyzer:
+    """Sistema unificado com 3 modos de análise e suporte a CLAHE."""
     
-    def __init__(self):
-        """Inicializa os analisadores individuais."""
-        self.texture_analyzer = TextureAnalyzer()
-        self.edge_analyzer = EdgeAnalyzer()
-        self.noise_analyzer = NoiseAnalyzer()
-        self.lighting_analyzer = LightingAnalyzer()
-    
-    def detect_sky_reflection(self, image):
-        """
-        Detecta reflexo de céu em superfícies reflexivas.
-        Céu = área grande, azul/cinza, com gradiente suave.
+    def __init__(self, use_clahe=True, clahe_clip_limit=2.0, clahe_tile_size=8):
+        self.use_clahe = use_clahe
+        self.clahe_clip_limit = clahe_clip_limit
+        self.clahe_tile_size = clahe_tile_size
         
-        Args:
-            image: Imagem (PIL ou numpy)
-            
-        Returns:
-            Dict com detecção e score de ajuste
-        """
+        self.texture_analyzer = TextureAnalyzer(
+            use_clahe=use_clahe,
+            clahe_clip_limit=clahe_clip_limit,
+            clahe_tile_size=clahe_tile_size
+        )
+        self.edge_analyzer = EdgeAnalyzer(
+            use_clahe=use_clahe,
+            clahe_clip_limit=clahe_clip_limit,
+            clahe_tile_size=clahe_tile_size
+        )
+        self.noise_analyzer = NoiseAnalyzer(
+            use_clahe=use_clahe,
+            clahe_clip_limit=clahe_clip_limit,
+            clahe_tile_size=clahe_tile_size
+        )
+        self.lighting_analyzer = LightingAnalyzer(
+            use_clahe=use_clahe,
+            clahe_clip_limit=clahe_clip_limit,
+            clahe_tile_size=clahe_tile_size
+        )
+    
+    def update_clahe_settings(self, use_clahe=None, clahe_clip_limit=None, clahe_tile_size=None):
+        if use_clahe is not None:
+            self.use_clahe = use_clahe
+            self.texture_analyzer.use_clahe = use_clahe
+            self.edge_analyzer.use_clahe = use_clahe
+            self.noise_analyzer.use_clahe = use_clahe
+            self.lighting_analyzer.use_clahe = use_clahe
+        
+        if clahe_clip_limit is not None:
+            self.clahe_clip_limit = clahe_clip_limit
+            self.texture_analyzer.clahe_clip_limit = clahe_clip_limit
+            self.edge_analyzer.clahe_clip_limit = clahe_clip_limit
+            self.noise_analyzer.clahe_clip_limit = clahe_clip_limit
+            self.lighting_analyzer.clahe_clip_limit = clahe_clip_limit
+        
+        if clahe_tile_size is not None:
+            self.clahe_tile_size = clahe_tile_size
+            self.texture_analyzer.clahe_tile_size = clahe_tile_size
+            self.edge_analyzer.clahe_tile_size = clahe_tile_size
+            self.noise_analyzer.clahe_tile_size = clahe_tile_size
+            self.lighting_analyzer.clahe_tile_size = clahe_tile_size
+    
+    def analyze_texture_only(self, image):
+        result = self.texture_analyzer.analyze_image(image)
+        
+        return {
+            "mode": "Texture Only (LBP)" + (" + CLAHE" if self.use_clahe else ""),
+            "score": result['score'],
+            "category": result['category'],
+            "description": result['description'],
+            "percent_suspicious": result['percent_suspicious'],
+            "visual_report": result['visual_report'],
+            "heatmap": result['heatmap'],
+            "clahe_enabled": result['clahe_enabled'],
+            "detailed_results": {"texture": result}
+        }
+    
+    def analyze_complete_fixed(self, image, weights=None):
+        if weights is None:
+            weights = {'texture': 0.30, 'edge': 0.25, 'noise': 0.20, 'lighting': 0.25}
+        
+        total_weight = sum(weights.values())
+        if total_weight > 0:
+            weights = {k: v / total_weight for k, v in weights.items()}
+        
+        texture_result = self.texture_analyzer.analyze_image(image)
+        edge_result = self.edge_analyzer.analyze_image(image)
+        noise_result = self.noise_analyzer.analyze_image(image)
+        lighting_result = self.lighting_analyzer.analyze_image(image)
+        
+        combined_score = (
+            texture_result['score'] * weights['texture'] +
+            edge_result['edge_score'] * weights['edge'] +
+            noise_result['noise_score'] * weights['noise'] +
+            lighting_result['lighting_score'] * weights['lighting']
+        )
+        
+        final_score = int(min(max(combined_score, 0), 100))
+        
+        if final_score <= 35:
+            category = "Alta chance de manipulação"
+            description = "Múltiplas análises indicam manipulação"
+        elif final_score <= 55:
+            category = "Textura suspeita"
+            description = "Revisão manual sugerida"
+        else:
+            category = "Textura natural"
+            description = "Baixa chance de manipulação"
+        
+        return {
+            "mode": "Complete Analysis (Fixed Weights)" + (" + CLAHE" if self.use_clahe else ""),
+            "score": final_score,
+            "category": category,
+            "description": description,
+            "weights_used": weights,
+            "clahe_enabled": self.use_clahe,
+            "individual_scores": {
+                "texture": texture_result['score'],
+                "edge": edge_result['edge_score'],
+                "noise": noise_result['noise_score'],
+                "lighting": lighting_result['lighting_score']
+            },
+            "visual_report": texture_result['visual_report'],
+            "heatmap": texture_result['heatmap'],
+            "detailed_results": {
+                "texture": texture_result,
+                "edge": edge_result,
+                "noise": noise_result,
+                "lighting": lighting_result
+            }
+        }
+    
+    def detect_sky_reflection(self, image, threshold=0.20):
         if isinstance(image, Image.Image):
             image = np.array(image)
         
         if len(image.shape) == 2:
             return {"has_sky_reflection": False, "sky_ratio": 0, "score_adjustment": 0}
         
-        # Converter para HSV
         hsv = cv2.cvtColor(image, cv2.COLOR_RGB2HSV)
         h, s, v = cv2.split(hsv)
         
-        # Detectar áreas com características de céu
-        # Céu: baixa saturação + alto valor (brilho)
         sky_mask = np.zeros(h.shape, dtype=np.uint8)
-        
-        # Condição 1: Áreas azuis/cinzas (Hue entre 90-130 para azul, ou qualquer Hue com baixa saturação)
         blue_sky = ((h >= 90) & (h <= 130) & (s < 100) & (v > 100))
         gray_sky = ((s < 50) & (v > 120))
-        
         sky_mask = (blue_sky | gray_sky).astype(np.uint8) * 255
         
-        # Calcular percentual da imagem que é céu
         sky_ratio = np.sum(sky_mask > 0) / sky_mask.size
+        has_sky_reflection = sky_ratio > threshold
         
-        # Se > 20% da imagem é reflexo de céu
-        has_sky_reflection = sky_ratio > 0.20
-        
-        # Score de ajuste proporcional à quantidade de céu
         if has_sky_reflection:
             score_adjustment = min(int(sky_ratio * 100), 30)
         else:
@@ -853,16 +934,7 @@ class AdaptiveWeightAnalyzer:
             "score_adjustment": score_adjustment
         }
     
-    def detect_reflective_surface(self, image):
-        """
-        Detecta se a imagem contém grande superfície reflexiva (vidro, lataria).
-        
-        Args:
-            image: Imagem (PIL ou numpy)
-            
-        Returns:
-            Dict com detecção e informações
-        """
+    def detect_reflective_surface(self, image, threshold=0.30):
         if isinstance(image, Image.Image):
             image = np.array(image)
         
@@ -871,30 +943,23 @@ class AdaptiveWeightAnalyzer:
         else:
             gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
         
-        # Calcular variância local
         kernel_size = 15
         mean = cv2.blur(gray.astype(np.float32), (kernel_size, kernel_size))
         mean_sq = cv2.blur((gray.astype(np.float32))**2, (kernel_size, kernel_size))
         variance = mean_sq - mean**2
         
-        # Áreas reflexivas têm alta variância local (reflexos contrastados)
-        # mas também áreas uniformes (reflexos de céu)
         high_variance = variance > np.percentile(variance, 70)
         low_variance = variance < np.percentile(variance, 30)
         
-        # Detectar gradientes suaves (característico de reflexos)
         gradient_x = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=5)
         gradient_y = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=5)
         gradient_magnitude = np.sqrt(gradient_x**2 + gradient_y**2)
         
-        # Reflexos têm gradientes moderados (não muito fortes, não muito fracos)
         moderate_gradients = (gradient_magnitude > 10) & (gradient_magnitude < 80)
-        
-        # Combinar características
         reflective_areas = (high_variance | (low_variance & moderate_gradients))
         reflective_ratio = np.sum(reflective_areas) / reflective_areas.size
         
-        is_reflective = reflective_ratio > 0.30
+        is_reflective = reflective_ratio > threshold
         
         return {
             "is_reflective": is_reflective,
@@ -902,82 +967,40 @@ class AdaptiveWeightAnalyzer:
             "confidence": min(reflective_ratio, 1.0)
         }
     
-    def get_adaptive_weights(self, image):
-        """
-        Determina pesos adaptativos baseado nas características da imagem.
-        
-        Args:
-            image: Imagem a ser analisada
-            
-        Returns:
-            Dict com pesos e ajustes
-        """
-        # Detectar características especiais
-        sky_detection = self.detect_sky_reflection(image)
-        reflective_detection = self.detect_reflective_surface(image)
-        
-        # Inicializar com pesos padrão
-        weights = {
-            'texture': 0.30,
-            'edge': 0.25,
-            'noise': 0.20,
-            'lighting': 0.25
-        }
-        bonus = 0
-        reasoning = "Pesos padrão"
-        
-        # CASO 1: Reflexo de céu detectado (ALTA PRIORIDADE)
-        if sky_detection["has_sky_reflection"]:
-            weights = {
-                'texture': 0.15,    # Reduzir muito (LBP falha aqui)
-                'edge': 0.15,       # Reduzir
-                'noise': 0.10,      # Reduzir
-                'lighting': 0.60    # MUITO peso para iluminação
-            }
-            bonus = sky_detection["score_adjustment"]
-            reasoning = f"Reflexo de céu detectado ({sky_detection['sky_ratio']*100:.1f}% da imagem)"
-        
-        # CASO 2: Superfície reflexiva (sem céu óbvio)
-        elif reflective_detection["is_reflective"]:
-            weights = {
-                'texture': 0.20,
-                'edge': 0.20,
-                'noise': 0.15,
-                'lighting': 0.45
-            }
-            bonus = 15
-            reasoning = f"Superfície reflexiva detectada ({reflective_detection['reflective_ratio']*100:.1f}%)"
-        
-        return {
-            'weights': weights,
-            'bonus': bonus,
-            'reasoning': reasoning,
-            'sky_detection': sky_detection,
-            'reflective_detection': reflective_detection
-        }
-    
-    def analyze_image_with_adaptive_weights(self, image):
-        """
-        Análise completa com pesos adaptativos.
-        
-        Args:
-            image: Imagem a ser analisada
-            
-        Returns:
-            Dict com todos os resultados e score final ajustado
-        """
-        # Executar todas as análises individuais
+    def analyze_adaptive(self, image, sky_threshold=0.20, sky_bonus=25,
+                        reflective_threshold=0.30, reflective_bonus=15):
         texture_result = self.texture_analyzer.analyze_image(image)
         edge_result = self.edge_analyzer.analyze_image(image)
         noise_result = self.noise_analyzer.analyze_image(image)
         lighting_result = self.lighting_analyzer.analyze_image(image)
         
-        # Obter pesos adaptativos
-        adaptive_config = self.get_adaptive_weights(image)
-        weights = adaptive_config['weights']
-        bonus = adaptive_config['bonus']
+        sky_detection = self.detect_sky_reflection(image, sky_threshold)
+        reflective_detection = self.detect_reflective_surface(image, reflective_threshold)
         
-        # Calcular score combinado com pesos adaptativos
+        if sky_detection["has_sky_reflection"]:
+            weights = {'texture': 0.15, 'edge': 0.15, 'noise': 0.10, 'lighting': 0.60}
+            bonus = min(sky_bonus, sky_detection["score_adjustment"])
+            reasoning = f"Reflexo de céu detectado ({sky_detection['sky_ratio']*100:.1f}%)"
+            if self.use_clahe:
+                reasoning += f" | CLAHE ativo (clip={self.clahe_clip_limit})"
+            detection_type = "Sky Reflection"
+        
+        elif reflective_detection["is_reflective"]:
+            weights = {'texture': 0.20, 'edge': 0.20, 'noise': 0.15, 'lighting': 0.45}
+            bonus = reflective_bonus
+            reasoning = f"Superfície reflexiva ({reflective_detection['reflective_ratio']*100:.1f}%)"
+            if self.use_clahe:
+                reasoning += f" | CLAHE ativo (clip={self.clahe_clip_limit})"
+            detection_type = "Reflective Surface"
+        
+        else:
+            weights = {'texture': 0.30, 'edge': 0.25, 'noise': 0.20, 'lighting': 0.25}
+            bonus = 0
+            reasoning = "Pesos padrão aplicados"
+            if self.use_clahe:
+                reasoning += f" | CLAHE ativo (clip={self.clahe_clip_limit})"
+            detection_type = "Standard"
+        
         combined_score = (
             texture_result['score'] * weights['texture'] +
             edge_result['edge_score'] * weights['edge'] +
@@ -986,132 +1009,140 @@ class AdaptiveWeightAnalyzer:
             bonus
         )
         
-        # Limitar entre 0-100
         final_score = int(min(max(combined_score, 0), 100))
         
-        # Classificar resultado final
         if final_score <= 35:
-            final_category = "Alta chance de manipulação"
-            final_description = "Textura artificial detectada"
-        elif final_score <= 50:
-            final_category = "Textura suspeita"
-            final_description = "Revisão manual sugerida"
+            category = "Alta chance de manipulação"
+            description = "Múltiplas análises indicam manipulação"
+        elif final_score <= 55:
+            category = "Textura suspeita"
+            description = "Revisão manual sugerida"
         else:
-            final_category = "Textura natural"
-            final_description = "Baixa chance de manipulação"
+            category = "Textura natural"
+            description = "Baixa chance de manipulação"
         
         return {
-            # Scores individuais
-            "texture_score": texture_result['score'],
-            "edge_score": edge_result['edge_score'],
-            "noise_score": noise_result['noise_score'],
-            "lighting_score": lighting_result['lighting_score'],
-            
-            # Score final
-            "final_score": final_score,
-            "final_category": final_category,
-            "final_description": final_description,
-            
-            # Configuração adaptativa aplicada
-            "adaptive_weights": weights,
+            "mode": "Adaptive Analysis" + (" + CLAHE" if self.use_clahe else ""),
+            "score": final_score,
+            "category": category,
+            "description": description,
+            "detection_type": detection_type,
+            "reasoning": reasoning,
+            "weights_used": weights,
             "bonus_applied": bonus,
-            "reasoning": adaptive_config['reasoning'],
-            
-            # Detecções especiais
-            "sky_detected": adaptive_config['sky_detection']['has_sky_reflection'],
-            "sky_ratio": adaptive_config['sky_detection']['sky_ratio'],
-            "reflective_surface": adaptive_config['reflective_detection']['is_reflective'],
-            
-            # Resultados completos de cada análise
-            "texture_result": texture_result,
-            "edge_result": edge_result,
-            "noise_result": noise_result,
-            "lighting_result": lighting_result
+            "clahe_enabled": self.use_clahe,
+            "clahe_settings": {
+                "clip_limit": self.clahe_clip_limit,
+                "tile_size": self.clahe_tile_size
+            } if self.use_clahe else None,
+            "individual_scores": {
+                "texture": texture_result['score'],
+                "edge": edge_result['edge_score'],
+                "noise": noise_result['noise_score'],
+                "lighting": lighting_result['lighting_score']
+            },
+            "detections": {
+                "sky": sky_detection,
+                "reflective": reflective_detection
+            },
+            "visual_report": texture_result['visual_report'],
+            "heatmap": texture_result['heatmap'],
+            "detailed_results": {
+                "texture": texture_result,
+                "edge": edge_result,
+                "noise": noise_result,
+                "lighting": lighting_result
+            }
         }
     
+    def analyze(self, image, mode="adaptive", **kwargs):
+        if mode == "texture_only":
+            return self.analyze_texture_only(image)
+        elif mode == "complete_fixed":
+            return self.analyze_complete_fixed(image, weights=kwargs.get('weights'))
+        elif mode == "adaptive":
+            return self.analyze_adaptive(
+                image,
+                sky_threshold=kwargs.get('sky_threshold', 0.20),
+                sky_bonus=kwargs.get('sky_bonus', 25),
+                reflective_threshold=kwargs.get('reflective_threshold', 0.30),
+                reflective_bonus=kwargs.get('reflective_bonus', 15)
+            )
+        else:
+            raise ValueError(f"Modo inválido: '{mode}'. Use 'texture_only', 'complete_fixed' ou 'adaptive'")
+    
     def generate_combined_visual_report(self, image, analysis_result):
-        """
-        Gera relatório visual combinado com todas as análises.
-        
-        Args:
-            image: Imagem original
-            analysis_result: Resultado da análise adaptativa
-            
-        Returns:
-            Imagem com visualização combinada
-        """
         if isinstance(image, Image.Image):
             image = np.array(image.convert('RGB'))
         
-        # Criar visualização
         visual = image.copy()
         font = cv2.FONT_HERSHEY_SIMPLEX
-        
-        # Adicionar informações principais
         y_offset = 30
         
-        # Score final (grande e destacado)
-        score_text = f"SCORE FINAL: {analysis_result['final_score']}/100"
-        cv2.putText(visual, score_text, (10, y_offset), font, 1.0, (0, 255, 0), 3)
-        y_offset += 40
+        score_text = f"SCORE: {analysis_result['score']}/100"
+        cv2.putText(visual, score_text, (10, y_offset), font, 1.0, (255, 255, 255), 3)
+        cv2.putText(visual, score_text, (10, y_offset), font, 1.0, (0, 255, 0), 2)
+        y_offset += 45
         
-        # Categoria
-        category_text = analysis_result['final_category']
-        color = (0, 255, 0) if analysis_result['final_score'] > 65 else (0, 165, 255) if analysis_result['final_score'] > 45 else (0, 0, 255)
+        category_text = analysis_result['category']
+        if analysis_result['score'] > 55:
+            color = (0, 255, 0)
+        elif analysis_result['score'] > 35:
+            color = (0, 165, 255)
+        else:
+            color = (0, 0, 255)
+        
+        cv2.putText(visual, category_text, (10, y_offset), font, 0.7, (255, 255, 255), 3)
         cv2.putText(visual, category_text, (10, y_offset), font, 0.7, color, 2)
         y_offset += 35
         
-        # Reasoning (por que esse score)
-        reasoning_lines = analysis_result['reasoning'].split('\n')
-        for line in reasoning_lines:
-            if len(line) > 50:
-                line = line[:47] + "..."
-            cv2.putText(visual, line, (10, y_offset), font, 0.5, (255, 255, 255), 1)
+        mode_text = f"Modo: {analysis_result['mode']}"
+        cv2.putText(visual, mode_text, (10, y_offset), font, 0.5, (200, 200, 200), 1)
+        y_offset += 25
+        
+        if analysis_result.get('clahe_enabled', False):
+            clahe_text = "CLAHE: ON"
+            if 'clahe_settings' in analysis_result and analysis_result['clahe_settings']:
+                settings = analysis_result['clahe_settings']
+                clahe_text += f" (clip={settings['clip_limit']}, tile={settings['tile_size']})"
+            cv2.putText(visual, clahe_text, (10, y_offset), font, 0.5, (0, 255, 0), 2)
             y_offset += 25
         
-        # Scores individuais
-        y_offset += 10
-        cv2.putText(visual, f"Texture: {analysis_result['texture_score']}", 
-                   (10, y_offset), font, 0.5, (200, 200, 200), 1)
-        y_offset += 20
-        cv2.putText(visual, f"Edge: {analysis_result['edge_score']}", 
-                   (10, y_offset), font, 0.5, (200, 200, 200), 1)
-        y_offset += 20
-        cv2.putText(visual, f"Noise: {analysis_result['noise_score']}", 
-                   (10, y_offset), font, 0.5, (200, 200, 200), 1)
-        y_offset += 20
-        cv2.putText(visual, f"Lighting: {analysis_result['lighting_score']}", 
-                   (10, y_offset), font, 0.5, (200, 200, 200), 1)
+        if 'reasoning' in analysis_result:
+            reasoning = analysis_result['reasoning']
+            max_chars = 45
+            reasoning_lines = [reasoning[i:i+max_chars] for i in range(0, len(reasoning), max_chars)]
+            
+            for line in reasoning_lines[:2]:
+                cv2.putText(visual, line, (10, y_offset), font, 0.45, (255, 255, 255), 1)
+                y_offset += 22
         
-        # Bonus aplicado
-        if analysis_result['bonus_applied'] > 0:
+        if 'individual_scores' in analysis_result:
+            y_offset += 10
+            scores = analysis_result['individual_scores']
+            cv2.putText(visual, f"T:{scores['texture']} E:{scores['edge']} " +
+                              f"N:{scores['noise']} L:{scores['lighting']}", 
+                       (10, y_offset), font, 0.5, (200, 200, 200), 1)
             y_offset += 20
-            cv2.putText(visual, f"Bonus: +{analysis_result['bonus_applied']}", 
-                       (10, y_offset), font, 0.5, (0, 255, 0), 2)
+        
+        if 'bonus_applied' in analysis_result and analysis_result['bonus_applied'] > 0:
+            bonus_text = f"Bonus: +{analysis_result['bonus_applied']}"
+            cv2.putText(visual, bonus_text, (10, y_offset), font, 0.5, (0, 255, 0), 2)
         
         return visual
 
 
-# Função auxiliar para integrar com o Mirror Glass
 def get_image_download_link(img, filename, text):
-    """
-    Gera link para download de imagem.
-    
-    Args:
-        img: Imagem como array numpy
-        filename: Nome do arquivo para download
-        text: Texto do link
-        
-    Returns:
-        HTML para link de download
-    """
     if isinstance(img, np.ndarray):
-        img_pil = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+        if len(img.shape) == 3 and img.shape[2] == 3:
+            img_pil = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+        else:
+            img_pil = Image.fromarray(img)
     else:
         img_pil = img
-        
+    
     buf = io.BytesIO()
-    img_pil.save(buf, format='JPEG')
+    img_pil.save(buf, format='JPEG', quality=95)
     buf.seek(0)
     
     img_str = base64.b64encode(buf.read()).decode()
