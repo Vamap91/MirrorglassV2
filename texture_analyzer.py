@@ -163,9 +163,17 @@ def analyze_texture_variance(self, image):
         return highlighted, heatmap
     
     def analyze_image(self, image):
+        """
+        Ponto de entrada principal para a análise de textura.
+        Orquestra a análise, geração de relatório e formatação do resultado.
+        """
+        # 1. Executa a análise de textura principal com a lógica aprimorada
         analysis_results = self.analyze_texture_variance(image)
+        
+        # 2. Gera o relatório visual com base nos resultados da análise
         visual_report, heatmap = self.generate_visual_report(image, analysis_results)
         
+        # 3. Extrai os dados finais para o dicionário de retorno
         score = analysis_results["naturalness_score"]
         category, description = self.classify_naturalness(score)
         percent_suspicious = float(np.mean(analysis_results["suspicious_mask"]) * 100)
@@ -180,7 +188,6 @@ def analyze_texture_variance(self, image):
             "analysis_results": analysis_results,
             "clahe_enabled": self.use_clahe
         }
-
 
 class EdgeAnalyzer:
     """Análise de bordas com suporte a CLAHE."""
