@@ -52,50 +52,76 @@ class TextureAnalyzer:
         
         return lbp, hist
     
-    def analyze_texture_variance(self, image):
-        if isinstance(image, Image.Image):
-            image = np.array(image)
-        
-        lbp_image, _ = self.calculate_lbp(image)
-        height, width = lbp_image.shape
-        rows = max(1, height // self.block_size)
-        cols = max(1, width // self.block_size)
-        
-        variance_map = np.zeros((rows, cols))
-        entropy_map = np.zeros((rows, cols))
-        
-        for i in range(0, height - self.block_size + 1, self.block_size):
-            for j in range(0, width - self.block_size + 1, self.block_size):
-                block = lbp_image[i:i+self.block_size, j:j+self.block_size]
-                
-                hist, _ = np.histogram(block, bins=10, range=(0, 10))
-                hist = hist.astype("float") / (hist.sum() + 1e-7)
-                block_entropy = entropy(hist)
-                
-                max_entropy = np.log(10)
-                norm_entropy = block_entropy / max_entropy if max_entropy > 0 else 0
-                block_variance = np.var(block) / 255.0
-                
-                row_idx = i // self.block_size
-                col_idx = j // self.block_size
-                
-                if row_idx < rows and col_idx < cols:
-                    variance_map[row_idx, col_idx] = block_variance
-                    entropy_map[row_idx, col_idx] = norm_entropy
-        
-        naturalness_map = entropy_map * 0.5 + variance_map * 0.5
-        norm_naturalness_map = cv2.normalize(naturalness_map, None, 0, 1, cv2.NORM_MINMAX)
-        suspicious_mask = norm_naturalness_map < self.threshold
-        naturalness_score = int(np.mean(norm_naturalness_map) * 100)
-        heatmap = cv2.applyColorMap((norm_naturalness_map * 255).astype(np.uint8), cv2.COLORMAP_JET)
-        
-        return {
-            "variance_map": variance_map,
-            "naturalness_map": norm_naturalness_map,
-            "suspicious_mask": suspicious_mask,
-            "naturalness_score": naturalness_score,
-            "heatmap": heatmap
-        }
+# Em texture_analyzer.py, dentro da classe TextureAnalyzer
+
+def analyze_texture_variance(self, image):
+    if isinstance(image, Image.Image):
+        image = np.array(image)
+    
+    lbp_image, _ = self.calculate_lbp(image)
+    height, width = lbp_image.shape
+    rows = max(1, height // self.block_size)
+    cols = max(1, width // self.block_size)
+    
+    variance_map = np.zeros((rows, cols))
+    entropy_map = np.zeros((rows, cols))
+    
+    for i in range(0, height - self.block_size + 1, self.block_size):
+        for j in range(0, width - self.block_size + 1, self.block_size):
+            block = lbp_image[i:i+self.block_size, j:j+self.block_size]
+            
+            hist, _ = np.histogram(block, bins=10, range=(0, 10))
+            hist = hist.astype("float") / (hist.sum() + 1e-7)
+            block_entropy = entropy(hist)
+            
+            max_entropy = np.log(10)
+            norm_entropy = block_entropy / max_entropy if max_entropy > 0 else 0
+            
+            # 🔥 MUDANÇA 1: Normalizar a variância do bloco para uma escala mais robusta
+            # A variância de um bloco LBP pode ser muito alta. Normalizamos por um valor empírico.
+            block_variance = np.var(block) / 100.0 # Usar um divisor mais agressivo que 255.0
+            
+            row_idx = i // self.block_size
+            col_idx = j // self.block_size
+            
+            if row_idx < rows and col_idx < cols:
+                variance_map[row_idx, col_idx] = block_variance
+                entropy_map[row_idx, col_idx] = norm_entropy
+    
+    # 🔥 MUDANÇA 2: Ajustar os pesos. A variância é um indicador mais forte.
+    # Damos 70% de peso para a variância e 30% para a entropia.
+    naturalness_map = (entropy_map * 0.3) + (variance_map * 0.7)
+    
+    norm_naturalness_map = cv2.normalize(naturalness_map, None, 0, 1, cv2.NORM_MINMAX)
+    
+    # 🔥 MUDANÇA 3: Tornar o limiar adaptativo em vez de fixo (self.threshold)
+    # Um limiar adaptativo é mais robusto para diferentes tipos de imagem.
+    # Calculamos o limiar como a média do mapa de naturalidade menos um desvio padrão.
+    # Isso significa que qualquer área significativamente menos "natural" que a média será marcada.
+    mean_naturalness = np.mean(norm_naturalness_map)
+    std_naturalness = np.std(norm_naturalness_map)
+    adaptive_threshold = max(0.1, mean_naturalness - (0.5 * std_naturalness)) # O 0.5 pode ser ajustado
+    
+    suspicious_mask = norm_naturalness_map < adaptive_threshold
+    
+    # 🔥 MUDANÇA 4: Ajustar o cálculo do score para ser mais sensível a áreas suspeitas.
+    # O score agora é uma combinação da naturalidade média e uma penalidade pelo percentual de áreas suspeitas.
+    percent_suspicious = np.mean(suspicious_mask)
+    base_score = np.mean(norm_naturalness_map) * 100
+    penalty = percent_suspicious * 50 # Penalidade forte: cada 10% de área suspeita remove 5 pontos.
+    
+    naturalness_score = int(max(0, min(100, base_score - penalty)))
+    
+    heatmap = cv2.applyColorMap((norm_naturalness_map * 255).astype(np.uint8), cv2.COLORMAP_JET)
+    
+    return {
+        "variance_map": variance_map,
+        "naturalness_map": norm_naturalness_map,
+        "suspicious_mask": suspicious_mask,
+        "naturalness_score": naturalness_score,
+        "heatmap": heatmap
+    }
+
     
     def classify_naturalness(self, score):
         if score <= 35:
