@@ -63,11 +63,13 @@ class TextureAnalyzer:
         
         variance_map = np.zeros((rows, cols))
         entropy_map = np.zeros((rows, cols))
+        uniformity_map = np.zeros((rows, cols))
         
         for i in range(0, height - self.block_size + 1, self.block_size):
             for j in range(0, width - self.block_size + 1, self.block_size):
                 block = lbp_image[i:i+self.block_size, j:j+self.block_size]
                 
+                # Calcular histograma
                 hist, _ = np.histogram(block, bins=10, range=(0, 10))
                 hist = hist.astype("float") / (hist.sum() + 1e-7)
                 block_entropy = entropy(hist)
@@ -76,17 +78,47 @@ class TextureAnalyzer:
                 norm_entropy = block_entropy / max_entropy if max_entropy > 0 else 0
                 block_variance = np.var(block) / 255.0
                 
+                # CRITICAL FIX: Detectar uniformidade artificial (IA)
+                # Se um único bin domina o histograma = textura artificial
+                max_hist_value = np.max(hist)
+                uniformity_penalty = 1.0 - max_hist_value  # 0 = muito uniforme, 1 = variado
+                
                 row_idx = i // self.block_size
                 col_idx = j // self.block_size
                 
                 if row_idx < rows and col_idx < cols:
                     variance_map[row_idx, col_idx] = block_variance
                     entropy_map[row_idx, col_idx] = norm_entropy
+                    uniformity_map[row_idx, col_idx] = uniformity_penalty
         
-        naturalness_map = entropy_map * 0.5 + variance_map * 0.5
+        # CRITICAL FIX: Combinar entropia + variância + penalidade de uniformidade
+        # Peso maior para entropia (70%) e uniformity (20%)
+        naturalness_map = (entropy_map * 0.60 + 
+                          variance_map * 0.20 + 
+                          uniformity_map * 0.20)
+        
+        # Normalizar para 0-1
         norm_naturalness_map = cv2.normalize(naturalness_map, None, 0, 1, cv2.NORM_MINMAX)
+        
+        # Áreas suspeitas = baixa naturalness (< threshold)
         suspicious_mask = norm_naturalness_map < self.threshold
-        naturalness_score = int(np.mean(norm_naturalness_map) * 100)
+        
+        # Score = média da naturalness (0-100)
+        # AJUSTE: Penalizar fortemente se houver muitas áreas uniformes
+        mean_naturalness = np.mean(norm_naturalness_map)
+        suspicious_ratio = np.mean(suspicious_mask)
+        
+        # Se > 20% da imagem é suspeita, reduzir score drasticamente
+        if suspicious_ratio > 0.20:
+            penalty_factor = 1.0 - (suspicious_ratio * 0.5)  # Até -50%
+            naturalness_score = int(mean_naturalness * penalty_factor * 100)
+        else:
+            naturalness_score = int(mean_naturalness * 100)
+        
+        # Garantir limites
+        naturalness_score = max(0, min(100, naturalness_score))
+        
+        # Heatmap: Azul (natural) → Vermelho (artificial)
         heatmap = cv2.applyColorMap((norm_naturalness_map * 255).astype(np.uint8), cv2.COLORMAP_JET)
         
         return {
@@ -94,7 +126,8 @@ class TextureAnalyzer:
             "naturalness_map": norm_naturalness_map,
             "suspicious_mask": suspicious_mask,
             "naturalness_score": naturalness_score,
-            "heatmap": heatmap
+            "heatmap": heatmap,
+            "suspicious_ratio": suspicious_ratio
         }
     
     def classify_naturalness(self, score):
