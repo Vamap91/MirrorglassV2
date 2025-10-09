@@ -1,6 +1,6 @@
 # texture_analyzer.py
 # Sistema Unificado de Análise de Imagens com CLAHE
-# Versão: 3.0.1 - Outubro 2025 (FIX: OpenCV type compatibility)
+# Versão: 3.0.1 - Janeiro 2025 (FIX: OpenCV type compatibility)
 
 import cv2
 import numpy as np
@@ -13,22 +13,22 @@ import base64
 
 
 class TextureAnalyzer:
-    """Análise de texturas usando LBP com suporte a CLAHE e lógica de detecção aprimorada."""
+    """Análise de texturas usando LBP com suporte a CLAHE."""
     
     def __init__(self, P=8, R=1, block_size=16, threshold=0.50, 
                  use_clahe=True, clahe_clip_limit=2.0, clahe_tile_size=8):
         self.P = P
         self.R = R
         self.block_size = block_size
-        self.threshold = threshold # Mantido por compatibilidade, mas a detecção principal é adaptativa
+        self.threshold = threshold
         self.use_clahe = use_clahe
         self.clahe_clip_limit = clahe_clip_limit
         self.clahe_tile_size = clahe_tile_size
     
     def apply_clahe(self, img_gray):
-        """Aplica o pré-processamento CLAHE se estiver ativado."""
         if not self.use_clahe:
             return img_gray
+        # Garantir que a imagem seja uint8
         if img_gray.dtype != np.uint8:
             img_gray = np.clip(img_gray, 0, 255).astype(np.uint8)
         clahe = cv2.createCLAHE(clipLimit=self.clahe_clip_limit,
@@ -36,7 +36,6 @@ class TextureAnalyzer:
         return clahe.apply(img_gray)
     
     def calculate_lbp(self, image):
-        """Converte a imagem para escala de cinza, aplica CLAHE e calcula o LBP."""
         if isinstance(image, Image.Image):
             img_gray = np.array(image.convert('L'))
         elif len(image.shape) > 2:
@@ -47,78 +46,56 @@ class TextureAnalyzer:
         img_gray = self.apply_clahe(img_gray)
         lbp = local_binary_pattern(img_gray, self.P, self.R, method="uniform")
         
-        return lbp, img_gray
+        n_bins = self.P + 2
+        hist, _ = np.histogram(lbp.ravel(), bins=n_bins, range=(0, n_bins))
+        hist = hist.astype("float") / (hist.sum() + 1e-7)
+        
+        return lbp, hist
     
-# Em texture_analyzer.py, dentro da classe TextureAnalyzer
-
-def analyze_texture_variance(self, image):
-    if isinstance(image, Image.Image):
-        image = np.array(image)
-    
-    lbp_image, _ = self.calculate_lbp(image)
-    height, width = lbp_image.shape
-    rows = max(1, height // self.block_size)
-    cols = max(1, width // self.block_size)
-    
-    variance_map = np.zeros((rows, cols))
-    entropy_map = np.zeros((rows, cols))
-    
-    for i in range(0, height - self.block_size + 1, self.block_size):
-        for j in range(0, width - self.block_size + 1, self.block_size):
-            block = lbp_image[i:i+self.block_size, j:j+self.block_size]
-            
-            hist, _ = np.histogram(block, bins=10, range=(0, 10))
-            hist = hist.astype("float") / (hist.sum() + 1e-7)
-            block_entropy = entropy(hist)
-            
-            max_entropy = np.log(10)
-            norm_entropy = block_entropy / max_entropy if max_entropy > 0 else 0
-            
-            # 🔥 MUDANÇA 1: Normalizar a variância do bloco para uma escala mais robusta
-            # A variância de um bloco LBP pode ser muito alta. Normalizamos por um valor empírico.
-            block_variance = np.var(block) / 100.0 # Usar um divisor mais agressivo que 255.0
-            
-            row_idx = i // self.block_size
-            col_idx = j // self.block_size
-            
-            if row_idx < rows and col_idx < cols:
-                variance_map[row_idx, col_idx] = block_variance
-                entropy_map[row_idx, col_idx] = norm_entropy
-    
-    # 🔥 MUDANÇA 2: Ajustar os pesos. A variância é um indicador mais forte.
-    # Damos 70% de peso para a variância e 30% para a entropia.
-    naturalness_map = (entropy_map * 0.3) + (variance_map * 0.7)
-    
-    norm_naturalness_map = cv2.normalize(naturalness_map, None, 0, 1, cv2.NORM_MINMAX)
-    
-    # 🔥 MUDANÇA 3: Tornar o limiar adaptativo em vez de fixo (self.threshold)
-    # Um limiar adaptativo é mais robusto para diferentes tipos de imagem.
-    # Calculamos o limiar como a média do mapa de naturalidade menos um desvio padrão.
-    # Isso significa que qualquer área significativamente menos "natural" que a média será marcada.
-    mean_naturalness = np.mean(norm_naturalness_map)
-    std_naturalness = np.std(norm_naturalness_map)
-    adaptive_threshold = max(0.1, mean_naturalness - (0.5 * std_naturalness)) # O 0.5 pode ser ajustado
-    
-    suspicious_mask = norm_naturalness_map < adaptive_threshold
-    
-    # 🔥 MUDANÇA 4: Ajustar o cálculo do score para ser mais sensível a áreas suspeitas.
-    # O score agora é uma combinação da naturalidade média e uma penalidade pelo percentual de áreas suspeitas.
-    percent_suspicious = np.mean(suspicious_mask)
-    base_score = np.mean(norm_naturalness_map) * 100
-    penalty = percent_suspicious * 50 # Penalidade forte: cada 10% de área suspeita remove 5 pontos.
-    
-    naturalness_score = int(max(0, min(100, base_score - penalty)))
-    
-    heatmap = cv2.applyColorMap((norm_naturalness_map * 255).astype(np.uint8), cv2.COLORMAP_JET)
-    
-    return {
-        "variance_map": variance_map,
-        "naturalness_map": norm_naturalness_map,
-        "suspicious_mask": suspicious_mask,
-        "naturalness_score": naturalness_score,
-        "heatmap": heatmap
-    }
-
+    def analyze_texture_variance(self, image):
+        if isinstance(image, Image.Image):
+            image = np.array(image)
+        
+        lbp_image, _ = self.calculate_lbp(image)
+        height, width = lbp_image.shape
+        rows = max(1, height // self.block_size)
+        cols = max(1, width // self.block_size)
+        
+        variance_map = np.zeros((rows, cols))
+        entropy_map = np.zeros((rows, cols))
+        
+        for i in range(0, height - self.block_size + 1, self.block_size):
+            for j in range(0, width - self.block_size + 1, self.block_size):
+                block = lbp_image[i:i+self.block_size, j:j+self.block_size]
+                
+                hist, _ = np.histogram(block, bins=10, range=(0, 10))
+                hist = hist.astype("float") / (hist.sum() + 1e-7)
+                block_entropy = entropy(hist)
+                
+                max_entropy = np.log(10)
+                norm_entropy = block_entropy / max_entropy if max_entropy > 0 else 0
+                block_variance = np.var(block) / 255.0
+                
+                row_idx = i // self.block_size
+                col_idx = j // self.block_size
+                
+                if row_idx < rows and col_idx < cols:
+                    variance_map[row_idx, col_idx] = block_variance
+                    entropy_map[row_idx, col_idx] = norm_entropy
+        
+        naturalness_map = entropy_map * 0.5 + variance_map * 0.5
+        norm_naturalness_map = cv2.normalize(naturalness_map, None, 0, 1, cv2.NORM_MINMAX)
+        suspicious_mask = norm_naturalness_map < self.threshold
+        naturalness_score = int(np.mean(norm_naturalness_map) * 100)
+        heatmap = cv2.applyColorMap((norm_naturalness_map * 255).astype(np.uint8), cv2.COLORMAP_JET)
+        
+        return {
+            "variance_map": variance_map,
+            "naturalness_map": norm_naturalness_map,
+            "suspicious_mask": suspicious_mask,
+            "naturalness_score": naturalness_score,
+            "heatmap": heatmap
+        }
     
     def classify_naturalness(self, score):
         if score <= 35:
@@ -163,17 +140,9 @@ def analyze_texture_variance(self, image):
         return highlighted, heatmap
     
     def analyze_image(self, image):
-        """
-        Ponto de entrada principal para a análise de textura.
-        Orquestra a análise, geração de relatório e formatação do resultado.
-        """
-        # 1. Executa a análise de textura principal com a lógica aprimorada
         analysis_results = self.analyze_texture_variance(image)
-        
-        # 2. Gera o relatório visual com base nos resultados da análise
         visual_report, heatmap = self.generate_visual_report(image, analysis_results)
         
-        # 3. Extrai os dados finais para o dicionário de retorno
         score = analysis_results["naturalness_score"]
         category, description = self.classify_naturalness(score)
         percent_suspicious = float(np.mean(analysis_results["suspicious_mask"]) * 100)
@@ -188,6 +157,7 @@ def analyze_texture_variance(self, image):
             "analysis_results": analysis_results,
             "clahe_enabled": self.use_clahe
         }
+
 
 class EdgeAnalyzer:
     """Análise de bordas com suporte a CLAHE."""
@@ -933,7 +903,6 @@ class UnifiedAnalyzer:
             "score": final_score,
             "category": category,
             "description": description,
-            "percent_suspicious": texture_result['percent_suspicious'],
             "weights_used": weights,
             "clahe_enabled": self.use_clahe,
             "individual_scores": {
@@ -1028,28 +997,45 @@ class UnifiedAnalyzer:
         sky_detection = self.detect_sky_reflection(image, sky_threshold)
         reflective_detection = self.detect_reflective_surface(image, reflective_threshold)
         
-        if sky_detection["has_sky_reflection"]:
-            weights = {'texture': 0.15, 'edge': 0.15, 'noise': 0.10, 'lighting': 0.60}
-            bonus = min(sky_bonus, sky_detection["score_adjustment"])
-            reasoning = f"Reflexo de céu detectado ({sky_detection['sky_ratio']*100:.1f}%)"
-            if self.use_clahe:
-                reasoning += f" | CLAHE ativo (clip={self.clahe_clip_limit})"
-            detection_type = "Sky Reflection"
+        # CRITICAL FIX: Se texture score é muito baixo (< 40), SEMPRE priorizar texture
+        # Isso evita falsos negativos em imagens manipuladas com vidro
+        texture_score = texture_result['score']
         
-        elif reflective_detection["is_reflective"]:
-            weights = {'texture': 0.20, 'edge': 0.20, 'noise': 0.15, 'lighting': 0.45}
-            bonus = reflective_bonus
-            reasoning = f"Superfície reflexiva ({reflective_detection['reflective_ratio']*100:.1f}%)"
+        if texture_score < 40:
+            # Imagem suspeita! Priorizar análise de textura mesmo com vidro
+            weights = {'texture': 0.50, 'edge': 0.20, 'noise': 0.15, 'lighting': 0.15}
+            bonus = 0
+            reasoning = f"Textura artificial forte (score={texture_score}) - Prioridade máxima"
             if self.use_clahe:
-                reasoning += f" | CLAHE ativo (clip={self.clahe_clip_limit})"
-            detection_type = "Reflective Surface"
+                reasoning += f" | CLAHE ativo"
+            detection_type = "Suspicious Texture Priority"
+        
+        elif sky_detection["has_sky_reflection"] and texture_score >= 50:
+            # Tem céu E textura OK = provavelmente legítimo
+            weights = {'texture': 0.25, 'edge': 0.20, 'noise': 0.15, 'lighting': 0.40}
+            # Bônus SOMENTE se texture score for razoável (>= 50)
+            bonus = min(15, sky_detection["score_adjustment"])
+            reasoning = f"Reflexo de céu ({sky_detection['sky_ratio']*100:.1f}%) + textura OK"
+            if self.use_clahe:
+                reasoning += f" | CLAHE ativo"
+            detection_type = "Sky Reflection (Natural)"
+        
+        elif reflective_detection["is_reflective"] and texture_score >= 50:
+            # Tem superfície reflexiva E textura OK
+            weights = {'texture': 0.30, 'edge': 0.25, 'noise': 0.20, 'lighting': 0.25}
+            bonus = min(10, reflective_bonus)
+            reasoning = f"Superfície reflexiva ({reflective_detection['reflective_ratio']*100:.1f}%) + textura OK"
+            if self.use_clahe:
+                reasoning += f" | CLAHE ativo"
+            detection_type = "Reflective Surface (Natural)"
         
         else:
-            weights = {'texture': 0.30, 'edge': 0.25, 'noise': 0.20, 'lighting': 0.25}
+            # Padrão: balanced weights
+            weights = {'texture': 0.40, 'edge': 0.25, 'noise': 0.20, 'lighting': 0.15}
             bonus = 0
-            reasoning = "Pesos padrão aplicados"
+            reasoning = "Análise padrão (pesos balanceados)"
             if self.use_clahe:
-                reasoning += f" | CLAHE ativo (clip={self.clahe_clip_limit})"
+                reasoning += f" | CLAHE ativo"
             detection_type = "Standard"
         
         combined_score = (
@@ -1062,10 +1048,11 @@ class UnifiedAnalyzer:
         
         final_score = int(min(max(combined_score, 0), 100))
         
-        if final_score <= 35:
+        # CRITICAL FIX: Classificação mais rigorosa
+        if final_score <= 45:
             category = "Alta chance de manipulação"
             description = "Múltiplas análises indicam manipulação"
-        elif final_score <= 55:
+        elif final_score <= 65:
             category = "Textura suspeita"
             description = "Revisão manual sugerida"
         else:
@@ -1077,7 +1064,6 @@ class UnifiedAnalyzer:
             "score": final_score,
             "category": category,
             "description": description,
-            "percent_suspicious": texture_result['percent_suspicious'],
             "detection_type": detection_type,
             "reasoning": reasoning,
             "weights_used": weights,
