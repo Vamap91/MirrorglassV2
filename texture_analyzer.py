@@ -1,6 +1,6 @@
 # texture_analyzer.py
 # Sistema de Análise Sequencial com Validação em Cadeia
-# Versão: 4.1.0 - Outubro 2025 (Fixed Detection + No Normalization)
+# Versão: 4.1.0 - Janeiro 2025 (Fixed Detection + No Normalization)
 
 import cv2
 import numpy as np
@@ -75,23 +75,27 @@ class TextureAnalyzer:
                     entropy_map[row_idx, col_idx] = norm_entropy
                     uniformity_map[row_idx, col_idx] = uniformity_penalty
         
-        # CRITICAL FIX: Combinar métricas SEM normalização posterior!
-        naturalness_map = (entropy_map * 0.60 + 
-                          variance_map * 0.20 + 
-                          uniformity_map * 0.20)
+        # CRITICAL FIX: Pesos ajustados para detectar IA
+        # Variância e uniformidade são mais importantes que entropia!
+        naturalness_map = (entropy_map * 0.30 +  # Reduzido de 0.60
+                          variance_map * 0.40 +   # Aumentado de 0.20
+                          uniformity_map * 0.30)  # Aumentado de 0.20
         
         # NÃO NORMALIZAR! Manter valores absolutos 0-1
-        # norm_naturalness_map = cv2.normalize(...) ← REMOVIDO!
         
         suspicious_mask = naturalness_map < self.threshold
         
         mean_naturalness = np.mean(naturalness_map)
         suspicious_ratio = np.mean(suspicious_mask)
         
-        # CRITICAL FIX: Penalização SEMPRE aplicada, não apenas se > 10%
-        # Penalização mais agressiva para baixa naturalness
-        penalty_factor = 1.0 - (suspicious_ratio * 1.5)  # Aumentado de 0.8 para 1.5
-        penalty_factor = max(0.3, penalty_factor)  # Não deixar menor que 0.3
+        # CRITICAL FIX: Penalização MUITO mais agressiva
+        # Qualquer sinal de uniformidade deve reduzir drasticamente o score
+        if suspicious_ratio > 0.05:  # Se > 5% da imagem é suspeita
+            penalty_factor = 1.0 - (suspicious_ratio * 3.0)  # Aumentado de 1.5 para 3.0!
+        else:
+            penalty_factor = 1.0 - (suspicious_ratio * 2.0)  # Mesmo pequenas áreas penalizam
+        
+        penalty_factor = max(0.2, penalty_factor)  # Mínimo 0.2 (era 0.3)
         
         naturalness_score = int(mean_naturalness * penalty_factor * 100)
         naturalness_score = max(0, min(100, naturalness_score))
@@ -111,10 +115,10 @@ class TextureAnalyzer:
         }
     
     def classify_naturalness(self, score):
-        # CRITICAL FIX: Threshold mais rigoroso
-        if score <= 45:  # Aumentado de 35 para 45
+        # CRITICAL FIX: Thresholds mais rigorosos
+        if score <= 50:  # Aumentado de 45 para 50
             return "Alta chance de manipulação", "Textura artificial detectada"
-        elif score <= 65:  # Aumentado de 55 para 65
+        elif score <= 68:  # Aumentado de 65 para 68
             return "Textura suspeita", "Revisão manual sugerida"
         else:
             return "Textura natural", "Baixa chance de manipulação"
@@ -449,8 +453,8 @@ class SequentialAnalyzer:
         all_scores['texture'] = texture_score
         validation_chain.append('texture')
         
-        # CRITICAL FIX: Threshold mais rigoroso (45 ao invés de 35)
-        if texture_score < 45:
+        # CRITICAL FIX: Threshold mais rigoroso (50 ao invés de 45)
+        if texture_score < 50:
             return {
                 "verdict": "MANIPULADA",
                 "confidence": 95,
@@ -465,7 +469,7 @@ class SequentialAnalyzer:
                 "detailed_reason": f"Score {texture_score}/100 indica textura artificial típica de IA."
             }
         
-        if texture_score > 70:
+        if texture_score > 75:  # Aumentado de 70 para 75
             return {
                 "verdict": "NATURAL",
                 "confidence": 85,
