@@ -1,6 +1,6 @@
 # texture_analyzer.py
 # Sistema de Análise Sequencial com Validação em Cadeia
-# Versão: 4.0.0 - Janeiro 2025 (Sequential Validation Logic)
+# Versão: 4.1.0 - Outubro 2025 (Fixed Detection + No Normalization)
 
 import cv2
 import numpy as np
@@ -75,40 +75,46 @@ class TextureAnalyzer:
                     entropy_map[row_idx, col_idx] = norm_entropy
                     uniformity_map[row_idx, col_idx] = uniformity_penalty
         
+        # CRITICAL FIX: Combinar métricas SEM normalização posterior!
         naturalness_map = (entropy_map * 0.60 + 
                           variance_map * 0.20 + 
                           uniformity_map * 0.20)
         
-        norm_naturalness_map = cv2.normalize(naturalness_map, None, 0, 1, cv2.NORM_MINMAX)
-        suspicious_mask = norm_naturalness_map < self.threshold
+        # NÃO NORMALIZAR! Manter valores absolutos 0-1
+        # norm_naturalness_map = cv2.normalize(...) ← REMOVIDO!
         
-        mean_naturalness = np.mean(norm_naturalness_map)
+        suspicious_mask = naturalness_map < self.threshold
+        
+        mean_naturalness = np.mean(naturalness_map)
         suspicious_ratio = np.mean(suspicious_mask)
         
-        # Penalização mais agressiva
-        if suspicious_ratio > 0.10:  # Reduzido de 0.20 para 0.10
-            penalty_factor = 1.0 - (suspicious_ratio * 0.8)  # Aumentado de 0.5 para 0.8
-            naturalness_score = int(mean_naturalness * penalty_factor * 100)
-        else:
-            naturalness_score = int(mean_naturalness * 100)
+        # CRITICAL FIX: Penalização SEMPRE aplicada, não apenas se > 10%
+        # Penalização mais agressiva para baixa naturalness
+        penalty_factor = 1.0 - (suspicious_ratio * 1.5)  # Aumentado de 0.8 para 1.5
+        penalty_factor = max(0.3, penalty_factor)  # Não deixar menor que 0.3
         
+        naturalness_score = int(mean_naturalness * penalty_factor * 100)
         naturalness_score = max(0, min(100, naturalness_score))
         
-        heatmap = cv2.applyColorMap((norm_naturalness_map * 255).astype(np.uint8), cv2.COLORMAP_JET)
+        # Heatmap para visualização (aqui SIM normalizar só para cores)
+        norm_for_display = cv2.normalize(naturalness_map, None, 0, 1, cv2.NORM_MINMAX)
+        heatmap = cv2.applyColorMap((norm_for_display * 255).astype(np.uint8), cv2.COLORMAP_JET)
         
         return {
             "variance_map": variance_map,
-            "naturalness_map": norm_naturalness_map,
+            "naturalness_map": naturalness_map,  # Valores absolutos!
             "suspicious_mask": suspicious_mask,
             "naturalness_score": naturalness_score,
             "heatmap": heatmap,
-            "suspicious_ratio": suspicious_ratio
+            "suspicious_ratio": suspicious_ratio,
+            "mean_naturalness_raw": mean_naturalness  # Para debug
         }
     
     def classify_naturalness(self, score):
-        if score <= 35:
+        # CRITICAL FIX: Threshold mais rigoroso
+        if score <= 45:  # Aumentado de 35 para 45
             return "Alta chance de manipulação", "Textura artificial detectada"
-        elif score <= 55:
+        elif score <= 65:  # Aumentado de 55 para 65
             return "Textura suspeita", "Revisão manual sugerida"
         else:
             return "Textura natural", "Baixa chance de manipulação"
@@ -127,7 +133,9 @@ class TextureAnalyzer:
         mask_resized = cv2.resize(suspicious_mask.astype(np.uint8), (width, height), 
                                  interpolation=cv2.INTER_NEAREST)
         
-        heatmap = cv2.applyColorMap((naturalness_map_resized * 255).astype(np.uint8), 
+        # Para visualização, normalizar
+        norm_for_display = cv2.normalize(naturalness_map_resized, None, 0, 1, cv2.NORM_MINMAX)
+        heatmap = cv2.applyColorMap((norm_for_display * 255).astype(np.uint8), 
                                     cv2.COLORMAP_JET)
         overlay = cv2.addWeighted(image, 0.6, heatmap, 0.4, 0)
         highlighted = overlay.copy()
@@ -141,7 +149,6 @@ class TextureAnalyzer:
         font = cv2.FONT_HERSHEY_SIMPLEX
         cv2.putText(highlighted, f"Score: {score}/100", (10, 30), font, 0.7, (255, 255, 255), 2)
         cv2.putText(highlighted, category, (10, 60), font, 0.7, (255, 255, 255), 2)
-        cv2.putText(highlighted, "CLAHE: OFF (Pure Texture)", (10, 90), font, 0.5, (255, 0, 0), 1)
         
         return highlighted, heatmap
     
@@ -201,14 +208,10 @@ class EdgeAnalyzer:
         gradient_y = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
         magnitude = np.sqrt(gradient_x**2 + gradient_y**2)
         direction = np.arctan2(gradient_y, gradient_x)
-        magnitude_normalized = cv2.normalize(magnitude, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
         
         return {
             "magnitude": magnitude,
-            "magnitude_normalized": magnitude_normalized,
-            "direction": direction,
-            "gradient_x": gradient_x,
-            "gradient_y": gradient_y
+            "direction": direction
         }
     
     def analyze_edge_coherence(self, image):
@@ -261,9 +264,6 @@ class EdgeAnalyzer:
         edge_score = int(np.mean(edge_naturalness) * 100)
         
         return {
-            "coherence_map": coherence_normalized,
-            "edge_density_map": edge_density_normalized,
-            "edge_naturalness_map": edge_naturalness,
             "edge_score": edge_score
         }
     
@@ -272,11 +272,11 @@ class EdgeAnalyzer:
         edge_score = coherence_results["edge_score"]
         
         if edge_score <= 40:
-            category = "Bordas artificiais detectadas"
+            category = "Bordas artificiais"
             description = "Alta probabilidade de manipulação"
         elif edge_score <= 65:
             category = "Bordas suspeitas"
-            description = "Requer verificação manual"
+            description = "Requer verificação"
         else:
             category = "Bordas naturais"
             description = "Baixa probabilidade de manipulação"
@@ -290,12 +290,10 @@ class EdgeAnalyzer:
 
 
 class NoiseAnalyzer:
-    """Análise de ruído COM CLAHE - detecta inconsistências."""
+    """Análise de ruído COM CLAHE."""
     
-    def __init__(self, block_size=32, sigma_threshold=0.15,
-                 use_clahe=True, clahe_clip_limit=2.0, clahe_tile_size=8):
+    def __init__(self, block_size=32, use_clahe=True, clahe_clip_limit=2.0, clahe_tile_size=8):
         self.block_size = block_size
-        self.sigma_threshold = sigma_threshold
         self.use_clahe = use_clahe
         self.clahe_clip_limit = clahe_clip_limit
         self.clahe_tile_size = clahe_tile_size
@@ -317,11 +315,6 @@ class NoiseAnalyzer:
         else:
             gray = image.copy()
         return self.apply_clahe(gray)
-    
-    def estimate_noise_level(self, image):
-        gray = self._convert_to_gray(image)
-        sigma = estimate_sigma(gray, average_sigmas=True, channel_axis=None)
-        return sigma
     
     def analyze_local_noise(self, image):
         if isinstance(image, Image.Image):
@@ -350,52 +343,25 @@ class NoiseAnalyzer:
                 except:
                     noise_map[row_idx, col_idx] = np.std(block)
         
-        noise_map_normalized = cv2.normalize(noise_map, None, 0, 1, cv2.NORM_MINMAX)
-        
-        return {
-            "noise_map": noise_map,
-            "noise_map_normalized": noise_map_normalized
-        }
-    
-    def detect_noise_inconsistencies(self, image):
-        global_noise = self.estimate_noise_level(image)
-        local_analysis = self.analyze_local_noise(image)
-        noise_map = local_analysis["noise_map"]
-        
         noise_mean = np.mean(noise_map)
         noise_std = np.std(noise_map)
         
-        if noise_mean > 0:
-            noise_cv = noise_std / noise_mean
-        else:
-            noise_cv = 0
-        
-        noise_deviation = np.abs(noise_map - noise_mean) / (noise_std + 1e-7)
-        suspicious_noise_mask = noise_deviation > 2.0
+        noise_cv = noise_std / noise_mean if noise_mean > 0 else 0
         noise_consistency_score = int(max(0, min(100, 100 - (noise_cv * 200))))
         
-        return {
-            "global_noise": global_noise,
-            "noise_mean": noise_mean,
-            "noise_std": noise_std,
-            "noise_cv": noise_cv,
-            "noise_deviation_map": noise_deviation,
-            "suspicious_noise_mask": suspicious_noise_mask,
-            "noise_consistency_score": noise_consistency_score
-        }
+        return noise_consistency_score
     
     def analyze_image(self, image):
-        inconsistency_results = self.detect_noise_inconsistencies(image)
-        noise_score = inconsistency_results["noise_consistency_score"]
+        noise_score = self.analyze_local_noise(image)
         
         if noise_score <= 40:
-            category = "Padrão de ruído artificial"
+            category = "Ruído artificial"
             description = "Alta probabilidade de manipulação"
         elif noise_score <= 65:
             category = "Ruído inconsistente"
-            description = "Requer verificação manual"
+            description = "Requer verificação"
         else:
-            category = "Ruído natural e consistente"
+            category = "Ruído natural"
             description = "Baixa probabilidade de manipulação"
         
         return {
@@ -407,15 +373,9 @@ class NoiseAnalyzer:
 
 
 class LightingAnalyzer:
-    """Analisador de iluminação COM CLAHE - valida física da luz."""
+    """Analisador de iluminação COM CLAHE."""
     
-    def __init__(self, reflection_weight=0.30, gradient_weight=0.30, 
-                 shadow_weight=0.20, global_weight=0.20,
-                 use_clahe=True, clahe_clip_limit=2.0, clahe_tile_size=8):
-        self.reflection_weight = reflection_weight
-        self.gradient_weight = gradient_weight
-        self.shadow_weight = shadow_weight
-        self.global_weight = global_weight
+    def __init__(self, use_clahe=True, clahe_clip_limit=2.0, clahe_tile_size=8):
         self.use_clahe = use_clahe
         self.clahe_clip_limit = clahe_clip_limit
         self.clahe_tile_size = clahe_tile_size
@@ -438,102 +398,26 @@ class LightingAnalyzer:
             gray = image.copy()
         return self.apply_clahe(gray)
     
-    def analyze_specular_reflections(self, image):
-        if isinstance(image, Image.Image):
-            image = np.array(image)
-        
-        if len(image.shape) == 2:
-            value_channel = self.apply_clahe(image)
-        else:
-            hsv = cv2.cvtColor(image, cv2.COLOR_RGB2HSV)
-            value_channel = hsv[:, :, 2]
-            value_channel = self.apply_clahe(value_channel)
-        
-        _, highlights = cv2.threshold(value_channel, 200, 255, cv2.THRESH_BINARY)
-        contours, _ = cv2.findContours(highlights, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        
-        natural_reflections = 0
-        total_area = 0
-        
-        for contour in contours:
-            area = cv2.contourArea(contour)
-            if 50 < area < 5000:
-                perimeter = cv2.arcLength(contour, True)
-                if perimeter > 0:
-                    circularity = 4 * np.pi * area / (perimeter ** 2)
-                    if 0.4 < circularity < 1.0:
-                        natural_reflections += 1
-                        total_area += area
-        
-        reflection_score = min(natural_reflections * 5, 30)
-        image_area = value_channel.shape[0] * value_channel.shape[1]
-        reflection_ratio = (total_area / image_area) * 100
-        
-        return {
-            "num_highlights": len(contours),
-            "natural_reflections": natural_reflections,
-            "reflection_ratio": reflection_ratio,
-            "score_adjustment": reflection_score
-        }
-    
-    def analyze_lighting_gradients(self, image):
+    def analyze_image(self, image):
         gray = self._convert_to_gray(image)
         
+        # Análise simplificada de iluminação
         gradient_x = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=5)
         gradient_y = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=5)
         magnitude = np.sqrt(gradient_x**2 + gradient_y**2)
-        direction = np.arctan2(gradient_y, gradient_x)
         
-        laplacian = cv2.Laplacian(gray, cv2.CV_64F, ksize=5)
-        smoothness = 1.0 / (np.std(laplacian) + 1)
-        
-        direction_hist, _ = np.histogram(direction, bins=36, range=(-np.pi, np.pi))
-        if np.sum(direction_hist) > 0:
-            direction_hist = direction_hist / np.sum(direction_hist)
-            direction_consistency = np.max(direction_hist)
-        else:
-            direction_consistency = 0
-        
-        abrupt_transitions = np.sum(magnitude > np.percentile(magnitude, 95))
-        abrupt_ratio = abrupt_transitions / magnitude.size
-        
-        gradient_score = 0
-        if smoothness > 0.05:
-            gradient_score += 10
-        if direction_consistency > 0.15:
-            gradient_score += 10
-        if abrupt_ratio < 0.05:
-            gradient_score += 10
-        
-        return {
-            "smoothness": smoothness,
-            "direction_consistency": direction_consistency,
-            "abrupt_ratio": abrupt_ratio,
-            "score_adjustment": gradient_score
-        }
-    
-    def analyze_image(self, image):
-        reflections = self.analyze_specular_reflections(image)
-        gradients = self.analyze_lighting_gradients(image)
-        
-        lighting_score = (
-            reflections["score_adjustment"] * self.reflection_weight +
-            gradients["score_adjustment"] * self.gradient_weight +
-            15 * self.shadow_weight +  # Score médio para sombras
-            20 * self.global_weight     # Score médio para consistência global
-        )
-        
-        lighting_score = int(min(max(lighting_score, 0), 100))
+        smoothness = 1.0 / (np.std(magnitude) + 1)
+        lighting_score = int(min(smoothness * 50, 30))  # Score simplificado
         
         if lighting_score >= 20:
             category = "Iluminação natural"
-            description = "Física da luz consistente"
+            description = "Física consistente"
         elif lighting_score >= 10:
             category = "Iluminação aceitável"
-            description = "Algumas inconsistências menores"
+            description = "Pequenas inconsistências"
         else:
             category = "Iluminação suspeita"
-            description = "Inconsistências físicas detectadas"
+            description = "Inconsistências detectadas"
         
         return {
             "lighting_score": lighting_score,
@@ -547,33 +431,30 @@ class SequentialAnalyzer:
     """Sistema de Análise Sequencial - Validação em Cadeia"""
     
     def __init__(self):
-        self.texture_analyzer = TextureAnalyzer()  # SEM CLAHE
+        self.texture_analyzer = TextureAnalyzer()
         self.edge_analyzer = EdgeAnalyzer(use_clahe=True)
         self.noise_analyzer = NoiseAnalyzer(use_clahe=True)
         self.lighting_analyzer = LightingAnalyzer(use_clahe=True)
     
     def analyze_sequential(self, image):
-        """
-        Análise sequencial com validação em cadeia.
-        Retorna assim que houver certeza suficiente.
-        """
+        """Análise sequencial com validação em cadeia."""
         validation_chain = []
         all_scores = {}
         
         # ========================================
-        # FASE 1: DETECTOR PRIMÁRIO (Textura SEM CLAHE)
+        # FASE 1: DETECTOR PRIMÁRIO (Textura)
         # ========================================
         texture_result = self.texture_analyzer.analyze_image(image)
         texture_score = texture_result['score']
         all_scores['texture'] = texture_score
         validation_chain.append('texture')
         
-        # CASO 1: Certeza de manipulação
-        if texture_score < 35:
+        # CRITICAL FIX: Threshold mais rigoroso (45 ao invés de 35)
+        if texture_score < 45:
             return {
                 "verdict": "MANIPULADA",
                 "confidence": 95,
-                "reason": "Textura artificial detectada (LBP puro)",
+                "reason": "Textura artificial detectada",
                 "main_score": texture_score,
                 "all_scores": all_scores,
                 "validation_chain": validation_chain,
@@ -581,10 +462,9 @@ class SequentialAnalyzer:
                 "visual_report": texture_result['visual_report'],
                 "heatmap": texture_result['heatmap'],
                 "percent_suspicious": texture_result['percent_suspicious'],
-                "detailed_reason": f"Score de textura muito baixo ({texture_score}/100). Padrão típico de IA generativa."
+                "detailed_reason": f"Score {texture_score}/100 indica textura artificial típica de IA."
             }
         
-        # CASO 2: Certeza de natural
         if texture_score > 70:
             return {
                 "verdict": "NATURAL",
@@ -597,10 +477,8 @@ class SequentialAnalyzer:
                 "visual_report": texture_result['visual_report'],
                 "heatmap": texture_result['heatmap'],
                 "percent_suspicious": texture_result['percent_suspicious'],
-                "detailed_reason": f"Score de textura alto ({texture_score}/100). Textura com variabilidade natural."
+                "detailed_reason": f"Score {texture_score}/100 indica textura natural."
             }
-        
-        # CASO 3: ZONA CINZA (35-70) → Ir para FASE 2
         
         # ========================================
         # FASE 2: VALIDADOR DE BORDAS
@@ -610,7 +488,6 @@ class SequentialAnalyzer:
         all_scores['edge'] = edge_score
         validation_chain.append('edge')
         
-        # CASO 4: Bordas confirmam manipulação
         if edge_score < 40:
             return {
                 "verdict": "MANIPULADA",
@@ -626,8 +503,6 @@ class SequentialAnalyzer:
                 "detailed_reason": f"Textura suspeita ({texture_score}/100) confirmada por bordas artificiais ({edge_score}/100)."
             }
         
-        # CASO 5: Bordas naturais mas textura ainda duvidosa → Ir para FASE 3
-        
         # ========================================
         # FASE 3: VALIDADOR DE RUÍDO
         # ========================================
@@ -636,12 +511,11 @@ class SequentialAnalyzer:
         all_scores['noise'] = noise_score
         validation_chain.append('noise')
         
-        # CASO 6: Ruído confirma manipulação
         if noise_score < 40:
             return {
                 "verdict": "MANIPULADA",
                 "confidence": 85,
-                "reason": "Múltiplos indicadores artificiais (textura + ruído)",
+                "reason": "Múltiplos indicadores artificiais",
                 "main_score": texture_score,
                 "all_scores": all_scores,
                 "validation_chain": validation_chain,
@@ -652,17 +526,14 @@ class SequentialAnalyzer:
                 "detailed_reason": f"Textura suspeita ({texture_score}/100) + ruído artificial ({noise_score}/100)."
             }
         
-        # CASO 7: Ainda inconclusivo → Ir para FASE 4
-        
         # ========================================
-        # FASE 4: VALIDADOR DE FÍSICA (Desempate)
+        # FASE 4: VALIDADOR DE FÍSICA
         # ========================================
         lighting_result = self.lighting_analyzer.analyze_image(image)
         lighting_score = lighting_result['lighting_score']
         all_scores['lighting'] = lighting_score
         validation_chain.append('lighting')
         
-        # CASO 8: Física impossível
         if lighting_score < 10:
             return {
                 "verdict": "MANIPULADA",
@@ -675,11 +546,11 @@ class SequentialAnalyzer:
                 "visual_report": texture_result['visual_report'],
                 "heatmap": texture_result['heatmap'],
                 "percent_suspicious": texture_result['percent_suspicious'],
-                "detailed_reason": f"Iluminação inconsistente ({lighting_score}/100) indica manipulação."
+                "detailed_reason": f"Iluminação inconsistente ({lighting_score}/100)."
             }
         
         # ========================================
-        # CASO 9: TODOS INCONCLUSIVOS - Calcular ponderado
+        # CASO FINAL: ANÁLISE INCONCLUSIVA
         # ========================================
         weighted_score = (
             texture_score * 0.50 +
@@ -688,14 +559,14 @@ class SequentialAnalyzer:
             lighting_score * 0.10
         )
         
-        if weighted_score < 50:
+        if weighted_score < 55:
             verdict = "SUSPEITA"
             confidence = 70
-            reason = "Múltiplos indicadores ambíguos - provável manipulação"
+            reason = "Múltiplos indicadores ambíguos"
         else:
             verdict = "INCONCLUSIVA"
             confidence = 60
-            reason = "Análise inconclusiva - revisão manual necessária"
+            reason = "Revisão manual necessária"
         
         return {
             "verdict": verdict,
@@ -708,7 +579,7 @@ class SequentialAnalyzer:
             "visual_report": texture_result['visual_report'],
             "heatmap": texture_result['heatmap'],
             "percent_suspicious": texture_result['percent_suspicious'],
-            "detailed_reason": f"Score ponderado: {int(weighted_score)}/100. Todos os testes foram inconclusivos."
+            "detailed_reason": f"Score ponderado: {int(weighted_score)}/100."
         }
 
 
@@ -727,5 +598,4 @@ def get_image_download_link(img, filename, text):
     
     img_str = base64.b64encode(buf.read()).decode()
     href = f'<a href="data:image/jpeg;base64,{img_str}" download="{filename}">{text}</a>'
-    
     return href
