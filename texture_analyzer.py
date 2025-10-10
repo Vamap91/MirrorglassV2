@@ -221,56 +221,100 @@ class _CLAHE:
 
 
 class EdgeAnalyzer:
-    """Bordas COM CLAHE (coerência direcional + densidade)."""
+    """
+    Bordas COM CLAHE – robusto a para-brisas/céus.
+    - mede densidade só nas regiões com detalhe (máscara)
+    - coerência via tensor de estrutura (mais estável)
+    - continuidade de borda (tamanho médio de contornos do Canny)
+    - nitidez (razão de bordas fortes/medianas)
+    - cenas com pouco detalhe retornam score neutro (~50)
+    """
 
     def __init__(self, block_size=24, use_clahe=True, clahe_clip_limit=2.0, clahe_tile_size=8):
         self.block = block_size
         self.clahe = _CLAHE(use_clahe, clahe_clip_limit, clahe_tile_size)
 
+    def _structure_tensor_coherency(self, gx, gy, sigma=2.0):
+        # tensor de estrutura
+        Jxx = cv2.GaussianBlur(gx*gx, (0, 0), sigma)
+        Jyy = cv2.GaussianBlur(gy*gy, (0, 0), sigma)
+        Jxy = cv2.GaussianBlur(gx*gy, (0, 0), sigma)
+
+        # autovalores fechados (2x2)
+        tmp = np.sqrt(np.maximum((Jxx - Jyy)**2 + 4.0*Jxy*Jxy, 0.0))
+        l1 = 0.5 * (Jxx + Jyy + tmp)
+        l2 = 0.5 * (Jxx + Jyy - tmp)
+        coherency = (l1 - l2) / (l1 + l2 + 1e-6)  # 0..1
+        return np.clip(coherency, 0.0, 1.0)
+
     def analyze_image(self, image):
         gray = _to_gray_uint8(image)
         gray = self.clahe.apply(gray)
 
+        # máscara de detalhe – só avalia borda “onde importa”
+        detail_mask, detail_ratio = compute_detail_mask(gray)
+
+        # se não há detalhe suficiente, devolve neutro (não condena)
+        if detail_ratio < 0.18:
+            edge_score = 50
+            cat, desc = "Bordas neutras", "Pouco detalhe na cena"
+            return {
+                "edge_score": edge_score,
+                "category": cat,
+                "description": desc,
+                "clahe_enabled": self.clahe.enable
+            }
+
+        # gradientes
         gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
         gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
-        mag = np.sqrt(gx * gx + gy * gy)
-        ang = np.arctan2(gy, gx)
+        mag = np.sqrt(gx*gx + gy*gy)
 
-        h, w = gray.shape
-        rows = max(1, h // self.block)
-        cols = max(1, w // self.block)
-        coh = np.zeros((rows, cols), np.float32)
-        den = np.zeros((rows, cols), np.float32)
+        # Canny com limiares automáticos (mediana)
+        v = float(np.median(gray))
+        lo = int(max(0, (1.0 - 0.33) * v))
+        hi = int(min(255, (1.0 + 0.33) * v))
+        edges = cv2.Canny(gray, lo, hi)
 
-        for i in range(0, h - self.block + 1, self.block):
-            for j in range(0, w - self.block + 1, self.block):
-                r, c = i // self.block, j // self.block
-                m = mag[i:i+self.block, j:j+self.block]
-                a = ang[i:i+self.block, j:j+self.block]
-                den[r, c] = float(np.mean(m) / 255.0)
+        # densidade de borda nas regiões com detalhe
+        m = detail_mask.astype(np.uint8)
+        det_pix = int(np.count_nonzero(m))
+        if det_pix == 0:
+            dens = 0.5
+        else:
+            dens = float(np.count_nonzero(edges & m)) / float(det_pix)  # 0..1
+        dens = float(np.clip(dens / 0.15, 0.0, 1.0))  # normaliza ≈15% como “bom”
 
-                if np.count_nonzero(m > 10) < 10:
-                    coh[r, c] = 0.5
-                    continue
+        # coerência via tensor de estrutura (média só no detalhe)
+        coher = self._structure_tensor_coherency(gx, gy)
+        coher = float(np.mean(coher[detail_mask]))  # 0..1
 
-                sig = m > np.percentile(m, 70)
-                if not np.any(sig):
-                    coh[r, c] = 0.5
-                    continue
-                ac = a[sig]
-                mean_cos = float(np.mean(np.cos(ac)))
-                mean_sin = float(np.mean(np.sin(ac)))
-                circ_var = 1.0 - np.sqrt(mean_cos ** 2 + mean_sin ** 2)
-                coh[r, c] = 1.0 - circ_var
+        # continuidade de borda: comprimento médio de contornos (normalizado)
+        cont_img = edges & m
+        cnts, _ = cv2.findContours(cont_img, cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE)
+        if len(cnts) == 0:
+            cont_score = 0.0
+        else:
+            lengths = [cv2.arcLength(c, False) for c in cnts]
+            mean_len = float(np.mean(lengths))
+            diag = (gray.shape[0]**2 + gray.shape[1]**2) ** 0.5
+            cont_score = float(np.clip(mean_len / (0.02 * diag), 0.0, 1.0))  # ~2% da diagonal é “ok”
 
-        coh_n = cv2.normalize(coh, None, 0, 1, cv2.NORM_MINMAX)
-        den_n = cv2.normalize(den, None, 0, 1, cv2.NORM_MINMAX)
-        edge_nat = 0.6 * coh_n + 0.4 * den_n
-        edge_score = int(float(np.mean(edge_nat)) * 100)
+        # nitidez: proporção de bordas fortes vs. medianas dentro do detalhe
+        p70 = np.percentile(mag[detail_mask], 70)
+        p90 = np.percentile(mag[detail_mask], 90)
+        strong = float(np.mean(mag[detail_mask] > p90))
+        medium = float(np.mean(mag[detail_mask] > p70)) + 1e-6
+        sharp = float(np.clip(strong / medium, 0.0, 1.0))
 
-        if edge_score <= 40:
+        # combinação – coerência domina, continuidade/nitidez ajudam, densidade ajusta
+        edge_nat = 0.45 * coher + 0.25 * cont_score + 0.20 * sharp + 0.10 * dens
+        edge_score = int(np.clip(edge_nat, 0.0, 1.0) * 100)
+
+        # rótulo
+        if edge_score <= 35:
             cat, desc = "Bordas artificiais", "Alta probabilidade de manipulação"
-        elif edge_score <= 65:
+        elif edge_score <= 60:
             cat, desc = "Bordas suspeitas", "Requer verificação"
         else:
             cat, desc = "Bordas naturais", "Baixa probabilidade de manipulação"
@@ -281,6 +325,7 @@ class EdgeAnalyzer:
             "description": desc,
             "clahe_enabled": self.clahe.enable
         }
+
 
 
 class NoiseAnalyzer:
