@@ -15,7 +15,7 @@ import base64
 class TextureAnalyzer:
     """Análise de texturas usando LBP - DETECTOR PRIMÁRIO (SEM CLAHE)."""
     
-    def __init__(self, P=8, R=1, block_size=16, threshold=0.50):
+    def __init__(self, P=8, R=1, block_size=24, threshold=0.50):
         self.P = P
         self.R = R
         self.block_size = block_size
@@ -181,7 +181,7 @@ class TextureAnalyzer:
 class EdgeAnalyzer:
     """Análise de bordas COM CLAHE - útil para revelar transições."""
     
-    def __init__(self, block_size=16, edge_threshold_low=50, edge_threshold_high=150,
+    def __init__(self, block_size=24, edge_threshold_low=50, edge_threshold_high=150,
                  use_clahe=True, clahe_clip_limit=2.0, clahe_tile_size=8):
         self.block_size = block_size
         self.edge_threshold_low = edge_threshold_low
