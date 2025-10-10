@@ -456,7 +456,7 @@ class SequentialAnalyzer:
         validation_chain.append('texture')
         
         # CRITICAL FIX: Threshold mais rigoroso (50 ao invés de 45)
-        if texture_score < 50:
+        if texture_score < 40:
             return {
                 "verdict": "MANIPULADA",
                 "confidence": 95,
@@ -471,7 +471,7 @@ class SequentialAnalyzer:
                 "detailed_reason": f"Score {texture_score}/100 indica textura artificial típica de IA."
             }
         
-        if texture_score > 75:  # Aumentado de 70 para 75
+        if texture_score > 80:
             return {
                 "verdict": "NATURAL",
                 "confidence": 85,
