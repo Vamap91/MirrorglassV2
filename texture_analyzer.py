@@ -329,59 +329,127 @@ class EdgeAnalyzer:
 
 
 class NoiseAnalyzer:
-    """Ruído COM CLAHE – consistência por CV dos sigmas locais."""
+    """
+    Análise de ruído SEM CLAHE.
+    - trabalha em float32 [0,1]
+    - mede ruído como MAD do resíduo high-pass (blur leve e subtração)
+    - ignora regiões sem detalhe (para-brisa/céu lisos)
+    - combina consistência espacial + presença de ruído plausível
+    """
 
-    def __init__(self, block_size=32, use_clahe=True, clahe_clip_limit=2.0, clahe_tile_size=8):
-        self.block = block_size
-        self.clahe = _CLAHE(use_clahe, clahe_clip_limit, clahe_tile_size)
+    def __init__(self, block_size=32, detail_grad_thresh=6.0, hp_sigma=1.0):
+        self.block = int(block_size)
+        self.grad_t = float(detail_grad_thresh)  # threshold do gradiente p/ máscara de detalhe
+        self.hp_sigma = float(hp_sigma)          # sigma do blur p/ high-pass
 
-    def analyze_image(self, image):
-        gray = _to_gray_uint8(image)
-        gray = self.clahe.apply(gray)
-        detail_mask, _ = compute_detail_mask(gray)
-
-        h, w = gray.shape
-        rows = max(1, h // self.block)
-        cols = max(1, w // self.block)
-        sigmas = []
-
-        for i in range(0, h - self.block + 1, self.block):
-            for j in range(0, w - self.block + 1, self.block):
-                mblk = detail_mask[i:i+self.block, j:j+self.block]
-                if float(np.mean(mblk)) < 0.10:
-                    # bloco liso → neutro (entra como média do conjunto)
-                    sigmas.append(0.0)
-                    continue
-                blk = gray[i:i+self.block, j:j+self.block]
-                try:
-                    sigma = float(estimate_sigma(blk, average_sigmas=True, channel_axis=None))
-                except Exception:
-                    sigma = float(np.std(blk))
-                sigmas.append(sigma)
-
-        if len(sigmas) == 0:
-            noise_score = 50  # neutro
+    # ---- utilidades internas ----
+    def _to_gray_float01(self, image):
+        if isinstance(image, Image.Image):
+            image = np.array(image)
+        if image.ndim == 3:
+            g = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.shape[2] == 3 else image[..., 0]
         else:
-            arr = np.array(sigmas, dtype=np.float32)
-            mean = float(np.mean(arr))
-            std  = float(np.std(arr))
-            cv   = (std / (mean + 1e-6)) if mean > 0 else 0.0
-            noise_score = int(np.clip(1.0 - min(cv, 0.5) * 2.0, 0, 1) * 100)
+            g = image
+        g = g.astype(np.float32)
+        if g.max() > 1.5:  # provavelmente 0..255
+            g *= (1.0 / 255.0)
+        return np.clip(g, 0.0, 1.0)
+
+    def _detail_mask(self, gray):
+        # gradiente sobel para achar áreas com “matéria”
+        gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+        gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+        mag = np.sqrt(gx * gx + gy * gy)
+        # limiar relativo: usa percentil para ser robusto a exposição
+        p90 = np.percentile(mag, 90.0)
+        thr = max(self.grad_t / 255.0, 0.15 * p90)
+        mask = (mag > thr).astype(np.uint8)
+        # limpa pontos isolados
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+        ratio = float(np.mean(mask))
+        return mask.astype(bool), ratio
+
+    def _sigma_map(self, gray):
+        # high-pass: residual = imagem - blur leve
+        blur = cv2.GaussianBlur(gray, (0, 0), self.hp_sigma)
+        resid = gray - blur
+        # sigma robusto por MAD: 1.4826 * mediana(|x - mediana(x)|)
+        # calcula por blocos
+        H, W = gray.shape
+        rows = max(1, H // self.block)
+        cols = max(1, W // self.block)
+        sigma = np.zeros((rows, cols), np.float32)
+
+        idx = 0
+        for i in range(0, H - self.block + 1, self.block):
+            for j in range(0, W - self.block + 1, self.block):
+                block = resid[i:i + self.block, j:j + self.block]
+                med = np.median(block)
+                mad = np.median(np.abs(block - med))
+                sigma[i // self.block, j // self.block] = 1.4826 * mad
+                idx += 1
+        return sigma
+
+    # ---- API principal ----
+    def analyze_image(self, image):
+        gray = self._to_gray_float01(image)
+
+        # máscara de detalhe: só usamos blocos com informação
+        dmask, dratio = self._detail_mask(gray)
+
+        sigma_map = self._sigma_map(gray)
+
+        # mapeia a máscara para grade de blocos
+        H, W = gray.shape
+        rows, cols = sigma_map.shape
+        # redução da máscara por média dentro do bloco
+        dmask_small = cv2.resize(dmask.astype(np.uint8), (cols, rows), interpolation=cv2.INTER_AREA) > 0
+
+        valid = dmask_small.sum()
+        # fallback: se quase não há detalhe, retorna score neutro
+        if valid < max(4, int(0.05 * rows * cols)):
+            noise_score = 50
+            category = "Ruído neutro"
+            description = "Cena com pouco detalhe — ruído não conclusivo"
+            return {
+                "noise_score": int(noise_score),
+                "category": category,
+                "description": description,
+                "clahe_enabled": False
+            }
+
+        sig_vals = sigma_map[dmask_small]
+        sig_mean = float(np.mean(sig_vals))
+        sig_std = float(np.std(sig_vals))
+        cv = sig_std / (sig_mean + 1e-8)  # consistência (menor é melhor)
+
+        # presença de ruído plausível (em 0..1)
+        # limites empíricos p/ imagens 0..1: 0.004 (muito alisado) a 0.04 (muito ruidoso)
+        present = np.clip((sig_mean - 0.004) / (0.02 - 0.004), 0.0, 1.0)
+        too_much = np.clip((sig_mean - 0.04) / 0.02, 0.0, 1.0)
+
+        consistency = np.clip(1.0 - 1.2 * cv, 0.0, 1.0)  # CV ~0 → 1.0 ; CV ~0.5 → ~0.4
+        plausibility = np.clip(present - 0.5 * too_much, 0.0, 1.0)
+
+        noise_nat = 0.65 * consistency + 0.35 * plausibility
+        noise_score = int(np.clip(noise_nat, 0.0, 1.0) * 100)
 
         if noise_score <= 40:
-            cat, desc = "Ruído artificial", "Alta probabilidade de manipulação"
+            category = "Ruído artificial"
+            description = "Inconsistente/irreal (alisamento ou padrões não naturais)"
         elif noise_score <= 65:
-            cat, desc = "Ruído inconsistente", "Requer verificação"
+            category = "Ruído inconsistente"
+            description = "Distribuição de ruído suspeita"
         else:
-            cat, desc = "Ruído natural", "Baixa probabilidade de manipulação"
+            category = "Ruído natural"
+            description = "Força e distribuição compatíveis com captura real"
 
         return {
-            "noise_score": noise_score,
-            "category": cat,
-            "description": desc,
-            "clahe_enabled": self.clahe.enable
+            "noise_score": int(noise_score),
+            "category": category,
+            "description": description,
+            "clahe_enabled": False
         }
-
 
 class LightingAnalyzer:
     """Iluminação COM CLAHE – suavidade + gradiente global."""
