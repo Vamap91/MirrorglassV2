@@ -468,21 +468,35 @@ class PlaneRegularityAnalyzer:
     def _to_gray01(self, image):
         return _to_gray_uint8(image).astype(np.float32) / 255.0
 
-    def _largest_smooth_region(self, gray01):
-        detail_mask, _ = compute_detail_mask(_safe_uint8(gray01 * 255))
-        smooth = (~detail_mask).astype(np.uint8) * 255
-        smooth = cv2.morphologyEx(smooth, cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8))
-        smooth = cv2.morphologyEx(smooth, cv2.MORPH_OPEN,  np.ones((5, 5), np.uint8))
+def _largest_smooth_region(self, gray01):
+    # gray01 vem em float 0..1 — converte para uint8 só para máscaras
+    gray_u8 = _safe_uint8(gray01 * 255)
 
-        num_labels, labels = cv2.connectedComponents(smooth > 0)
-        if num_labels <= 1:
-            return None, 0.0
+    # máscara de detalhe já usada no pipeline
+    detail_mask, _ = compute_detail_mask(gray_u8)
 
-        areas = [(lab, int(np.sum(labels == lab))) for lab in range(1, num_labels)]
-        lab_max, area_max = max(areas, key=lambda x: x[1])
-        mask = (labels == lab_max)
-        plane_ratio = float(area_max) / float(gray01.size)
-        return mask, plane_ratio
+    # região lisa = complemento do detalhe
+    smooth = (~detail_mask).astype(np.uint8) * 255
+
+    # limpeza morfológica
+    smooth = cv2.morphologyEx(smooth, cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8))
+    smooth = cv2.morphologyEx(smooth, cv2.MORPH_OPEN,  np.ones((5, 5), np.uint8))
+
+    # ✅ PASSA uint8 para connectedComponents (0/1), não bool
+    bin_img = (smooth > 0).astype(np.uint8)
+    num_labels, labels = cv2.connectedComponents(bin_img, connectivity=8, ltype=cv2.CV_32S)
+
+    if num_labels <= 1:
+        return None, 0.0
+
+    # pega o maior componente (ignora rótulo 0 = fundo)
+    areas = [(lab, int(np.sum(labels == lab))) for lab in range(1, num_labels)]
+    lab_max, area_max = max(areas, key=lambda x: x[1])
+
+    mask = (labels == lab_max)          # bool
+    plane_ratio = float(area_max) / float(gray_u8.size)
+    return mask, plane_ratio
+
 
     def analyze_image(self, image):
         gray = self._to_gray01(image)
