@@ -1,644 +1,484 @@
 # texture_analyzer.py
-# Sistema de Análise Sequencial com Validação em Cadeia
-# Versão: 4.4.0 - limiar dinâmico P25 + co-localização textura×borda + exit prudente na Fase 2
+# MirrorGlass V4.2 – Sequencial + Priors de Câmera
+# (jan/2025) — foco em reduzir falso-positivo em fotos reais.
 
 import cv2
 import numpy as np
 from skimage.feature import local_binary_pattern
 from skimage.restoration import estimate_sigma
-from scipy.stats import entropy
+from scipy.stats import entropy, pearsonr
 from PIL import Image
 import io
 import base64
 
 
-# ================================
-# TEXTURA (SEM CLAHE)
-# ================================
+# =========================
+# Utilidades de pré-processo
+# =========================
+def to_numpy_rgb(img):
+    """Aceita PIL ou np.ndarray BGR/RGB e devolve np.uint8 RGB."""
+    if isinstance(img, Image.Image):
+        arr = np.array(img.convert("RGB"))
+    else:
+        arr = img.copy()
+        if arr.ndim == 2:
+            arr = cv2.cvtColor(arr, cv2.COLOR_GRAY2RGB)
+        elif arr.shape[2] == 3:  # pode vir BGR
+            # heurística: se média do canal 0 for ~azul forte, é BGR
+            # mas é barato sempre converter assumindo BGR:
+            arr = cv2.cvtColor(arr, cv2.COLOR_BGR2RGB)
+    return arr
+
+
+def safe_resize_long_side(img_rgb, long_side=1024):
+    """Redimensiona preservando aspecto. Usa INTER_AREA ao reduzir."""
+    h, w = img_rgb.shape[:2]
+    if max(h, w) <= long_side:
+        return img_rgb
+    if h >= w:
+        new_h, new_w = long_side, int(w * (long_side / h))
+    else:
+        new_w, new_h = long_side, int(h * (long_side / w))
+    return cv2.resize(img_rgb, (new_w, new_h), interpolation=cv2.INTER_AREA)
+
+
+def rgb2gray_u8(img_rgb):
+    g = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2GRAY)
+    if g.dtype != np.uint8:
+        g = np.clip(g, 0, 255).astype(np.uint8)
+    return g
+
+
+# =========================
+# Priors (sinais típicos de foto)
+# =========================
+class PhotoPriors:
+    """
+    Priors que aparecem em fotos reais:
+      • Desfoque/Laplaciano moderado (não zero).
+      • Blocagem/periódico 8×8 (JPEG).
+      • Correlação ruído × luminância (mais ruído em áreas escuras).
+    Usamos esses sinais como 'absolvedores' quando os validadores não indicam IA forte.
+    """
+
+    def __init__(self):
+        pass
+
+    @staticmethod
+    def blur_laplacian(gray):
+        # Variância do Laplaciano – foco: 0..~3000 (depende do tamanho)
+        return float(cv2.Laplacian(gray, cv2.CV_64F).var())
+
+    @staticmethod
+    def jpeg_blockiness(gray):
+        """
+        Mede diferença média em fronteiras de blocos 8x8.
+        Valores típicos:
+          ~0.5–1.5 (uint8) em JPEGs comuns 1080p reamostrados,
+          ~0.1–0.3 em PNG/sem blocagem.
+        Retorna valor normalizado 0..1 (aprox).
+        """
+        g = gray.astype(np.float32)
+        # diferenças nas colunas/linhas múltiplas de 8
+        dif_c = []
+        for c in range(8, g.shape[1], 8):
+            dif_c.append(np.abs(g[:, c] - g[:, c - 1]).mean())
+        dif_r = []
+        for r in range(8, g.shape[0], 8):
+            dif_r.append(np.abs(g[r, :] - g[r - 1, :]).mean())
+        if not dif_c and not dif_r:
+            return 0.0
+        raw = (np.mean(dif_c) if dif_c else 0.0 + np.mean(dif_r) if dif_r else 0.0) / (2 if dif_c and dif_r else 1)
+        # normalização suave
+        return float(np.clip(raw / 2.0, 0.0, 1.0))
+
+    @staticmethod
+    def noise_luma_correlation(img_rgb):
+        """
+        Correlaciona ruído de alta frequência com luminância.
+        Em fotos reais: correlação tende a ser NEGATIVA (regiões escuras com mais ruído).
+        Retorna correlação (−1..+1). Valores <= −0.2 favorecem 'foto'.
+        """
+        gray = rgb2gray_u8(img_rgb).astype(np.float32)
+        # high-pass simples
+        hp = gray - cv2.GaussianBlur(gray, (0, 0), 1.2)
+        # luminância (0..1)
+        luma = gray / 255.0
+        # variância local de ruído (janela 7x7)
+        hp2 = hp * hp
+        var_local = cv2.GaussianBlur(hp2, (0, 0), 2.0)
+        # correlaciona var_local com luminância
+        v = var_local.flatten()
+        l = luma.flatten()
+        # evita NaNs
+        if np.std(v) < 1e-6 or np.std(l) < 1e-6:
+            return 0.0
+        corr = pearsonr(v, l)[0]
+        return float(corr)
+
+    def compute(self, img_rgb):
+        gray = rgb2gray_u8(img_rgb)
+        blur = self.blur_laplacian(gray)
+        block = self.jpeg_blockiness(gray)
+        corr = self.noise_luma_correlation(img_rgb)
+        return {
+            "blur_var_laplacian": blur,
+            "jpeg_blockiness": block,
+            "noise_luma_corr": corr,  # NEGATIVO favorece foto
+        }
+
+
+# =========================
+# Analise de TEXTURA (LBP)
+# =========================
 class TextureAnalyzer:
-    """Detector primário por textura usando LBP multi-escala (SEM CLAHE)."""
+    """Detector primário – LBP multiescala SEM CLAHE."""
+    def __init__(self, block_size=24, threshold=0.50):
+        self.block = block_size
+        self.threshold = threshold
+        # multiescala: (P,R)
+        self.scales = [(8, 1), (16, 2)]
 
-    def __init__(self, block_size=24):
-        self.block_size = int(block_size)
+    def _lbp_hist(self, gray, P, R):
+        lbp = local_binary_pattern(gray, P, R, method="uniform")
+        n_bins = P + 2
+        hist, _ = np.histogram(lbp.ravel(), bins=n_bins, range=(0, n_bins))
+        hist = hist.astype("float32") / (hist.sum() + 1e-7)
+        return lbp, hist
 
-    # ---------- helpers ----------
-    def _ensure_gray_uint8(self, image):
-        if isinstance(image, Image.Image):
-            img = np.array(image.convert("L"))
-        elif image.ndim == 3:
-            img = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        else:
-            img = image.copy()
+    def analyze_texture_variance(self, img_rgb):
+        gray = rgb2gray_u8(img_rgb)
+        H, W = gray.shape
 
-        # Normaliza tamanho para estabilidade estatística
-        h, w = img.shape
-        max_side = max(h, w)
-        if max_side > 1200:
-            scale = 1200.0 / max_side
-            img = cv2.resize(img, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
+        # concatena mapas por escala
+        maps = []
+        for (P, R) in self.scales:
+            lbp, _ = self._lbp_hist(gray, P, R)
+            maps.append(lbp.astype(np.float32) / (P + 2))
+        lbp_stack = np.mean(maps, axis=0)  # média das escalas
 
-        if img.dtype != np.uint8:
-            img = np.clip(img, 0, 255).astype(np.uint8)
-        return img
+        rows = max(1, H // self.block)
+        cols = max(1, W // self.block)
+        variance_map = np.zeros((rows, cols), np.float32)
+        entropy_map = np.zeros((rows, cols), np.float32)
+        uniformity_map = np.zeros((rows, cols), np.float32)
 
-    def calculate_lbp_multiscale(self, image):
-        """
-        LBP em duas escalas:
-          - (P=8,  R=1)   → microtextura
-          - (P=16, R=2)   → macrotextura
-        Combina em [0,1] (peso maior para macro).
-        """
-        gray = self._ensure_gray_uint8(image)
-        lbp1 = local_binary_pattern(gray, 8, 1, method="uniform")     # 0..10
-        lbp2 = local_binary_pattern(gray, 16, 2, method="uniform")    # 0..18
-        lbp1_n = lbp1 / float(8 + 2)
-        lbp2_n = lbp2 / float(16 + 2)
-        lbp_combined = np.clip(0.4 * lbp1_n + 0.6 * lbp2_n, 0.0, 1.0)
-        return lbp_combined, gray
+        # usa 12 bins na entropia para mais resolução
+        for i in range(0, H - self.block + 1, self.block):
+            for j in range(0, W - self.block + 1, self.block):
+                block = lbp_stack[i:i+self.block, j:j+self.block]
+                hist, _ = np.histogram(block, bins=12, range=(0, 1.0))
+                hist = hist.astype("float32") / (hist.sum() + 1e-7)
+                e = entropy(hist)
+                max_e = np.log(12.0)
+                norm_e = (e / max_e) if max_e > 0 else 0.0
 
-    # ---------- core ----------
-    def analyze_texture_variance(self, image):
-        if isinstance(image, Image.Image):
-            image_np = np.array(image)
-        else:
-            image_np = image
+                v = float(np.var(block))
+                # penaliza “um pico só” no hist
+                uniformity_pen = 1.0 - float(np.max(hist))
 
-        lbp_norm, gray = self.calculate_lbp_multiscale(image_np)  # ∈ [0,1]
-        H, W = lbp_norm.shape
-        rows = max(1, H // self.block_size)
-        cols = max(1, W // self.block_size)
+                r, c = i // self.block, j // self.block
+                variance_map[r, c] = v
+                entropy_map[r, c] = norm_e
+                uniformity_map[r, c] = uniformity_pen
 
-        variance_map   = np.zeros((rows, cols), dtype=np.float32)
-        entropy_map    = np.zeros((rows, cols), dtype=np.float32)
-        uniformity_map = np.zeros((rows, cols), dtype=np.float32)
-        edge_map_local = np.zeros((rows, cols), dtype=np.float32)
+        # pesos equilibrados
+        naturalness_map = 0.35 * entropy_map + 0.40 * variance_map + 0.25 * uniformity_map
 
-        # mapa de borda p/ “gate” e co-localização
-        gx = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
-        gy = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
-        mag = np.sqrt(gx * gx + gy * gy)
+        suspicious_mask = naturalness_map < self.threshold
+        suspicious_ratio = float(np.mean(suspicious_mask))
+        mean_nat = float(np.mean(naturalness_map))
 
-        for i in range(0, H - self.block_size + 1, self.block_size):
-            for j in range(0, W - self.block_size + 1, self.block_size):
-                r = i // self.block_size
-                c = j // self.block_size
+        # penalização MAIS suave (evita FP)
+        penalty = 1.0 - 0.9 * suspicious_ratio
+        penalty = float(np.clip(penalty, 0.6, 1.0))
 
-                block = lbp_norm[i:i+self.block_size, j:j+self.block_size]
+        score = int(np.clip(mean_nat * penalty * 100.0, 0, 100))
 
-                # histograma 0..1 (10 bins)
-                hist, _ = np.histogram(block, bins=10, range=(0, 1))
-                hist = hist.astype(np.float32) / (hist.sum() + 1e-7)
-                e = float(entropy(hist) / np.log(10))        # 0..1
-                v = float(np.var(block))                     # 0..~0.2
-                u = float(1.0 - np.max(hist))                # 0..1
-
-                block_mag = mag[i:i+self.block_size, j:j+self.block_size]
-                edge_map_local[r, c] = float(np.mean(block_mag))
-
-                variance_map[r, c]   = v
-                entropy_map[r, c]    = e
-                uniformity_map[r, c] = u
-
-        # força de borda normalizada por percentil (robusto a outliers)
-        p90 = np.percentile(edge_map_local, 90) + 1e-6
-        edge_strength = np.clip(edge_map_local / p90, 0, 1)  # 0..1
-
-        # mapa de “naturalidade”
-        naturalness_map = 0.50 * variance_map + 0.30 * entropy_map + 0.20 * uniformity_map
-
-        # -------- Limiar DINÂMICO (percentil + ajuste por detalhe global) --------
-        # Menos agressivo: P25 reduz falso-positivo em lataria/vidro reais.
-        detail_level = float(np.var(cv2.Laplacian(gray, cv2.CV_64F)))
-        thr_dyn = float(np.percentile(naturalness_map, 25))   # <— P25 (antes P30)
-        if detail_level < 40:     # cena lisa → relaxa
-            thr_dyn *= 0.88
-        elif detail_level > 150:  # cena muito detalhada → exige mais
-            thr_dyn *= 1.10
-        thr_dyn = float(np.clip(thr_dyn, 0.04, 0.60))
-        # -------------------------------------------------------------------------
-
-        # máscara suspeita + gate por borda (suspeitos em borda pesam menos)
-        suspicious_mask = (naturalness_map < thr_dyn).astype(np.float32)
-        gate = (1.0 - 0.6 * edge_strength)  # 0.4 .. 1.0
-        gated_suspicious = suspicious_mask * gate
-
-        # Componente A: razão de suspeitos (quanto menor, melhor)
-        suspicious_ratio = float(np.mean(gated_suspicious))
-        comp_ratio = 1.0 - suspicious_ratio                   # 0..1
-
-        # Componente B: nível médio normalizado no contexto da imagem
-        nm_min, nm_max = float(naturalness_map.min()), float(naturalness_map.max())
-        comp_level = float((naturalness_map.mean() - nm_min) / (nm_max - nm_min + 1e-6))
-        comp_level = float(np.clip(comp_level, 0.0, 1.0))
-
-        # Score final 60/40
-        naturalness_score = int(np.clip(0.6 * comp_ratio + 0.4 * comp_level, 0, 1) * 100)
-
-        # --- Co-localização textura×borda para absolvição posterior/exit prudente ---
-        # Quanto da suspeita está em regiões de *baixa borda* (edge_strength < 0.3)?
-        # Se for baixo, a “suspeita” coincide com bordas fortes (amassado/contorno), sinal pró-real.
-        low_edge = (edge_strength < 0.3).astype(np.float32)
-        total_susp = float(suspicious_mask.sum() + 1e-6)
-        overlap_low_edge = float((suspicious_mask * low_edge).sum() / total_susp)  # 0..1
-        # ---------------------------------------------------------------------------
-
-        # heatmap para visualização
+        # mapas visuais
         disp = cv2.normalize(naturalness_map, None, 0, 1, cv2.NORM_MINMAX)
         heatmap = cv2.applyColorMap((disp * 255).astype(np.uint8), cv2.COLORMAP_JET)
 
         return {
-            "variance_map": variance_map,
             "naturalness_map": naturalness_map,
-            "suspicious_mask": (suspicious_mask > 0.5),
-            "naturalness_score": naturalness_score,
+            "suspicious_mask": suspicious_mask,
+            "naturalness_score": score,
             "heatmap": heatmap,
             "suspicious_ratio": suspicious_ratio,
-            "mean_naturalness_raw": float(naturalness_map.mean()),
-            "edge_strength_map": edge_strength,         # para análises posteriores
-            "overlap_low_edge": overlap_low_edge        # <— NOVO: usado no sequencial
+            "mean_naturalness_raw": mean_nat,
         }
 
-    def classify_naturalness(self, score):
-        if score <= 40:
-            return "Alta chance de manipulação", "Textura muito artificial"
-        elif score <= 68:
-            return "Textura suspeita", "Revisão manual sugerida"
+    @staticmethod
+    def classify(score):
+        if score < 38:
+            return "Alta chance de manipulação", "Textura fortemente artificial"
+        elif score < 62:
+            return "Textura intermediária", "Sinais mistos"
         else:
-            return "Textura natural", "Baixa chance de manipulação"
-
-    def generate_visual_report(self, image, analysis_results):
-        if isinstance(image, Image.Image):
-            image = np.array(image.convert('RGB'))
-
-        naturalness_map = analysis_results["naturalness_map"]
-        suspicious_mask = analysis_results["suspicious_mask"]
-        score = analysis_results["naturalness_score"]
-
-        h, w = image.shape[:2]
-        nm_resized = cv2.resize(naturalness_map, (w, h), interpolation=cv2.INTER_LINEAR)
-        mask_resized = cv2.resize(suspicious_mask.astype(np.uint8), (w, h), interpolation=cv2.INTER_NEAREST)
-
-        disp = cv2.normalize(nm_resized, None, 0, 1, cv2.NORM_MINMAX)
-        heatmap = cv2.applyColorMap((disp * 255).astype(np.uint8), cv2.COLORMAP_JET)
-        overlay = cv2.addWeighted(image, 0.6, heatmap, 0.4, 0)
-        highlighted = overlay.copy()
-
-        contours, _ = cv2.findContours(mask_resized, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        cv2.drawContours(highlighted, contours, -1, (0, 0, 255), 2)
-
-        category, _ = self.classify_naturalness(score)
-        font = cv2.FONT_HERSHEY_SIMPLEX
-        cv2.putText(highlighted, f"Score: {score}/100", (10, 30), font, 0.7, (255, 255, 255), 2)
-        cv2.putText(highlighted, category, (10, 60), font, 0.7, (255, 255, 255), 2)
-
-        return highlighted, heatmap
-
-    def analyze_image(self, image):
-        analysis_results = self.analyze_texture_variance(image)
-        visual_report, heatmap = self.generate_visual_report(image, analysis_results)
-
-        score = analysis_results["naturalness_score"]
-        category, description = self.classify_naturalness(score)
-        percent_suspicious = float(np.mean(analysis_results["suspicious_mask"]) * 100)
-
-        return {
-            "score": score,
-            "category": category,
-            "description": description,
-            "percent_suspicious": percent_suspicious,
-            "visual_report": visual_report,
-            "heatmap": heatmap,
-            "analysis_results": analysis_results,
-            "clahe_enabled": False
-        }
+            return "Textura natural", "Alta variabilidade"
 
 
-# ================================
-# BORDAS (COM CLAHE)
-# ================================
+# =========================
+# BORDAS, RUÍDO, ILUMINAÇÃO
+# =========================
 class EdgeAnalyzer:
-    """Análise de bordas COM CLAHE — coerência direcional + densidade."""
+    def __init__(self, block_size=24, use_clahe=True, clahe_clip=2.0, clahe_tile=8):
+        self.block = block_size
+        self.use_clahe = use_clahe
+        self.clip = clahe_clip
+        self.tile = clahe_tile
 
-    def __init__(self, block_size=24, use_clahe=True, clahe_clip_limit=2.0, clahe_tile_size=8):
-        self.block_size = int(block_size)
-        self.use_clahe = bool(use_clahe)
-        self.clahe_clip_limit = float(clahe_clip_limit)
-        self.clahe_tile_size = int(clahe_tile_size)
+    def _gray(self, img_rgb):
+        g = rgb2gray_u8(img_rgb)
+        if self.use_clahe:
+            clahe = cv2.createCLAHE(clipLimit=self.clip, tileGridSize=(self.tile, self.tile))
+            g = clahe.apply(g)
+        return g
 
-    def apply_clahe(self, img_gray):
-        if not self.use_clahe:
-            return img_gray
-        if img_gray.dtype != np.uint8:
-            img_gray = np.clip(img_gray, 0, 255).astype(np.uint8)
-        clahe = cv2.createCLAHE(clipLimit=self.clahe_clip_limit,
-                                tileGridSize=(self.clahe_tile_size, self.clahe_tile_size))
-        return clahe.apply(img_gray)
+    def analyze(self, img_rgb):
+        gray = self._gray(img_rgb)
+        H, W = gray.shape
+        gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+        gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+        mag = np.sqrt(gx*gx + gy*gy)
+        ang = np.arctan2(gy, gx)
 
-    def _convert_to_gray(self, image):
-        if isinstance(image, Image.Image):
-            gray = np.array(image.convert('L'))
-        elif image.ndim == 3:
-            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        else:
-            gray = image.copy()
-        return self.apply_clahe(gray)
+        rows, cols = max(1, H // self.block), max(1, W // self.block)
+        coh = np.zeros((rows, cols), np.float32)
+        den = np.zeros((rows, cols), np.float32)
 
-    def compute_gradients(self, image):
-        gray = self._convert_to_gray(image)
-        gx = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
-        gy = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
-        magnitude = np.sqrt(gx**2 + gy**2)
-        direction = np.arctan2(gy, gx)
-        return {"magnitude": magnitude, "direction": direction}
-
-    def analyze_edge_coherence(self, image):
-        if isinstance(image, Image.Image):
-            image = np.array(image)
-
-        gray = self._convert_to_gray(image)
-        h, w = gray.shape
-
-        grads = self.compute_gradients(image)
-        magnitude = grads["magnitude"]
-        direction = grads["direction"]
-
-        rows = max(1, h // self.block_size)
-        cols = max(1, w // self.block_size)
-
-        coherence_map = np.zeros((rows, cols), dtype=np.float32)
-        edge_density_map = np.zeros((rows, cols), dtype=np.float32)
-
-        for i in range(0, h - self.block_size + 1, self.block_size):
-            for j in range(0, w - self.block_size + 1, self.block_size):
-                r = i // self.block_size
-                c = j // self.block_size
-
-                block_mag = magnitude[i:i+self.block_size, j:j+self.block_size]
-                block_dir = direction[i:i+self.block_size, j:j+self.block_size]
-
-                edge_density_map[r, c] = float(np.mean(block_mag))  # normaliza adiante
-
-                if np.sum(block_mag > np.percentile(block_mag, 60)) > 8:
-                    significant = block_mag > np.percentile(block_mag, 70)
-                    if np.any(significant):
-                        dirs = block_dir[significant]
-                        mean_cos = float(np.mean(np.cos(dirs)))
-                        mean_sin = float(np.mean(np.sin(dirs)))
-                        circ_var = 1.0 - np.sqrt(mean_cos**2 + mean_sin**2)
-                        coherence_map[r, c] = 1.0 - circ_var
-                    else:
-                        coherence_map[r, c] = 0.6
+        for i in range(0, H - self.block + 1, self.block):
+            for j in range(0, W - self.block + 1, self.block):
+                m = mag[i:i+self.block, j:j+self.block]
+                a = ang[i:i+self.block, j:j+self.block]
+                r, c = i // self.block, j // self.block
+                den[r, c] = float(np.mean(m)) / 255.0
+                # coerência direcional
+                m_th = m > np.percentile(m, 70)
+                if np.any(m_th):
+                    aa = a[m_th]
+                    coh[r, c] = 1.0 - (1.0 - np.sqrt(np.mean(np.cos(aa))**2 + np.mean(np.sin(aa))**2))
                 else:
-                    coherence_map[r, c] = 0.6  # bloco sem borda não acusa fraude
+                    coh[r, c] = 0.5
 
-        coherence_n = cv2.normalize(coherence_map, None, 0, 1, cv2.NORM_MINMAX)
-        edge_density_n = cv2.normalize(edge_density_map, None, 0, 1, cv2.NORM_MINMAX)
-        edge_naturalness = 0.6 * coherence_n + 0.4 * edge_density_n
-        edge_score = int(np.clip(np.mean(edge_naturalness) * 100.0, 0, 100))
-        return {"edge_score": edge_score}
-
-    def analyze_image(self, image):
-        res = self.analyze_edge_coherence(image)
-        edge_score = res["edge_score"]
-
-        if edge_score <= 35:
-            category = "Bordas artificiais"
-            description = "Alta probabilidade de manipulação"
-        elif edge_score <= 65:
-            category = "Bordas suspeitas"
-            description = "Requer verificação"
-        else:
-            category = "Bordas naturais"
-            description = "Baixa probabilidade de manipulação"
-
-        return {
-            "edge_score": edge_score,
-            "category": category,
-            "description": description,
-            "clahe_enabled": self.use_clahe
-        }
+        den = cv2.normalize(den, None, 0, 1, cv2.NORM_MINMAX)
+        coh = cv2.normalize(coh, None, 0, 1, cv2.NORM_MINMAX)
+        edge_nat = 0.55 * coh + 0.45 * den
+        score = int(np.mean(edge_nat) * 100.0)
+        return {"edge_score": score}
 
 
-# ================================
-# RUÍDO (COM CLAHE)
-# ================================
 class NoiseAnalyzer:
-    """Análise de ruído COM CLAHE — consistência por blocos."""
+    def __init__(self, block_size=32, use_clahe=True, clahe_clip=2.0, clahe_tile=8):
+        self.block = block_size
+        self.use_clahe = use_clahe
+        self.clip = clahe_clip
+        self.tile = clahe_tile
 
-    def __init__(self, block_size=32, use_clahe=True, clahe_clip_limit=2.0, clahe_tile_size=8):
-        self.block_size = int(block_size)
-        self.use_clahe = bool(use_clahe)
-        self.clahe_clip_limit = float(clahe_clip_limit)
-        self.clahe_tile_size = int(clahe_tile_size)
+    def _gray(self, img_rgb):
+        g = rgb2gray_u8(img_rgb)
+        if self.use_clahe:
+            clahe = cv2.createCLAHE(clipLimit=self.clip, tileGridSize=(self.tile, self.tile))
+            g = clahe.apply(g)
+        return g
 
-    def apply_clahe(self, img_gray):
-        if not self.use_clahe:
-            return img_gray
-        if img_gray.dtype != np.uint8:
-            img_gray = np.clip(img_gray, 0, 255).astype(np.uint8)
-        clahe = cv2.createCLAHE(clipLimit=self.clahe_clip_limit,
-                                tileGridSize=(self.clahe_tile_size, self.clahe_tile_size))
-        return clahe.apply(img_gray)
+    def analyze(self, img_rgb):
+        gray = self._gray(img_rgb)
+        H, W = gray.shape
+        rows, cols = max(1, H // self.block), max(1, W // self.block)
+        nmap = np.zeros((rows, cols), np.float32)
 
-    def _convert_to_gray(self, image):
-        if isinstance(image, Image.Image):
-            gray = np.array(image.convert('L'))
-        elif image.ndim == 3:
-            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        else:
-            gray = image.copy()
-        return self.apply_clahe(gray)
-
-    def analyze_local_noise(self, image):
-        if isinstance(image, Image.Image):
-            image = np.array(image)
-
-        gray = self._convert_to_gray(image)
-        h, w = gray.shape
-
-        rows = max(1, h // self.block_size)
-        cols = max(1, w // self.block_size)
-        noise_map = np.zeros((rows, cols), dtype=np.float32)
-
-        for i in range(0, h - self.block_size + 1, self.block_size):
-            for j in range(0, w - self.block_size + 1, self.block_size):
-                r = i // self.block_size
-                c = j // self.block_size
-                block = gray[i:i+self.block_size, j:j+self.block_size]
+        for i in range(0, H - self.block + 1, self.block):
+            for j in range(0, W - self.block + 1, self.block):
+                blk = gray[i:i+self.block, j:j+self.block]
+                r, c = i // self.block, j // self.block
                 try:
-                    sigma = float(estimate_sigma(block, average_sigmas=True, channel_axis=None))
+                    sigma = estimate_sigma(blk, average_sigmas=True, channel_axis=None)
                 except Exception:
-                    sigma = float(np.std(block))
-                noise_map[r, c] = sigma
+                    sigma = float(np.std(blk))
+                nmap[r, c] = sigma
 
-        noise_mean = float(np.mean(noise_map))
-        noise_std  = float(np.std(noise_map))
-        noise_cv = noise_std / noise_mean if noise_mean > 0 else 0.0
-
-        noise_consistency_score = int(np.clip(100.0 - 160.0 * noise_cv, 0, 100))
-        return noise_consistency_score
-
-    def analyze_image(self, image):
-        noise_score = self.analyze_local_noise(image)
-
-        if noise_score <= 40:
-            category = "Ruído artificial"
-            description = "Alta probabilidade de manipulação"
-        elif noise_score <= 65:
-            category = "Ruído inconsistente"
-            description = "Requer verificação"
-        else:
-            category = "Ruído natural"
-            description = "Baixa probabilidade de manipulação"
-
-        return {
-            "noise_score": noise_score,
-            "category": category,
-            "description": description,
-            "clahe_enabled": self.use_clahe
-        }
+        mu, sd = float(np.mean(nmap)), float(np.std(nmap))
+        cv = sd / (mu + 1e-6)
+        # maior consistência => maior score
+        score = int(np.clip(100.0 - 220.0 * cv, 0, 100))
+        return {"noise_score": score}
 
 
-# ================================
-# ILUMINAÇÃO (COM CLAHE)
-# ================================
 class LightingAnalyzer:
-    """Análise simples de iluminação COM CLAHE (gradiente global)."""
+    def __init__(self, use_clahe=True, clahe_clip=2.0, clahe_tile=8):
+        self.use_clahe = use_clahe
+        self.clip = clahe_clip
+        self.tile = clahe_tile
 
-    def __init__(self, use_clahe=True, clahe_clip_limit=2.0, clahe_tile_size=8):
-        self.use_clahe = bool(use_clahe)
-        self.clahe_clip_limit = float(clahe_clip_limit)
-        self.clahe_tile_size = int(clahe_tile_size)
+    def _gray(self, img_rgb):
+        g = rgb2gray_u8(img_rgb)
+        if self.use_clahe:
+            clahe = cv2.createCLAHE(clipLimit=self.clip, tileGridSize=(self.tile, self.tile))
+            g = clahe.apply(g)
+        return g
 
-    def apply_clahe(self, img_gray):
-        if not self.use_clahe:
-            return img_gray
-        if img_gray.dtype != np.uint8:
-            img_gray = np.clip(img_gray, 0, 255).astype(np.uint8)
-        clahe = cv2.createCLAHE(clipLimit=self.clahe_clip_limit,
-                                tileGridSize=(self.clahe_tile_size, self.clahe_tile_size))
-        return clahe.apply(img_gray)
-
-    def _convert_to_gray(self, image):
-        if isinstance(image, Image.Image):
-            gray = np.array(image.convert('L'))
-        elif image.ndim == 3:
-            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        else:
-            gray = image.copy()
-        return self.apply_clahe(gray)
-
-    def analyze_image(self, image):
-        gray = self._convert_to_gray(image)
-        gx = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=5)
-        gy = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=5)
-        magnitude = np.sqrt(gx**2 + gy**2)
-
-        smoothness = 1.0 / (np.std(magnitude) + 1.0)
-        lighting_score = int(min(smoothness * 50.0, 30.0))
-
-        if lighting_score >= 20:
-            category = "Iluminação natural"
-            description = "Física consistente"
-        elif lighting_score >= 10:
-            category = "Iluminação aceitável"
-            description = "Pequenas inconsistências"
-        else:
-            category = "Iluminação suspeita"
-            description = "Inconsistências detectadas"
-
-        return {
-            "lighting_score": lighting_score,
-            "category": category,
-            "description": description,
-            "clahe_enabled": self.use_clahe
-        }
+    def analyze(self, img_rgb):
+        gray = self._gray(img_rgb)
+        gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=5)
+        gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=5)
+        mag = np.sqrt(gx*gx + gy*gy)
+        smoothness = 1.0 / (np.std(mag) + 1.0)
+        score = int(min(smoothness * 55.0, 35.0))  # 0..35
+        return {"lighting_score": score}
 
 
-# ================================
-# SEQUENCIAL (VALIDAÇÃO EM CADEIA)
-# ================================
+# =========================
+# Sequencial + Arbitragem
+# =========================
 class SequentialAnalyzer:
-    """Sistema de Análise Sequencial - early-exit prudente + absolvedor."""
-
-    def __init__(self):
-        self.texture_analyzer  = TextureAnalyzer()
-        self.edge_analyzer     = EdgeAnalyzer(use_clahe=True)
-        self.noise_analyzer    = NoiseAnalyzer(use_clahe=True)
-        self.lighting_analyzer = LightingAnalyzer(use_clahe=True)
+    def __init__(self, long_side_px=1024):
+        self.texture = TextureAnalyzer()
+        self.edge = EdgeAnalyzer()
+        self.noise = NoiseAnalyzer()
+        self.light = LightingAnalyzer()
+        self.priors = PhotoPriors()
+        self.long_side = long_side_px
 
     def analyze_sequential(self, image):
-        validation_chain = []
-        all_scores = {}
+        # ---------- pré-processo padronizado ----------
+        rgb = to_numpy_rgb(image)
+        rgb = safe_resize_long_side(rgb, self.long_side)
 
-        # 1) TEXTURA
-        tex = self.texture_analyzer.analyze_image(image)
-        t_score = tex['score']
-        all_scores['texture'] = t_score
-        validation_chain.append('texture')
+        # ---------- priors de câmera ----------
+        p = self.priors.compute(rgb)
+        blur_ok = p["blur_var_laplacian"] >= 40.0          # desfoque muito baixo => imagem “plana”
+        jpeg_ok = p["jpeg_blockiness"] >= 0.12             # blocagem visível sugere foto
+        corr_ok = p["noise_luma_corr"] <= -0.20            # ruído ↑ em áreas escuras
+        photo_prior_votes = sum([blur_ok, jpeg_ok, corr_ok])
 
-        if t_score < 40:
-            return {
-                "verdict": "MANIPULADA",
-                "confidence": 95,
-                "reason": "Textura muito artificial",
-                "main_score": t_score,
-                "all_scores": all_scores,
-                "validation_chain": validation_chain,
-                "phases_executed": 1,
-                "visual_report": tex['visual_report'],
-                "heatmap": tex['heatmap'],
-                "percent_suspicious": tex['percent_suspicious'],
-                "detailed_reason": f"Score {t_score}/100 abaixo do limiar."
-            }
+        # ---------- FASE 1: Textura ----------
+        t_res = self.texture.analyze_texture_variance(rgb)
+        t_score = t_res["naturalness_score"]
+        vis_img, heat = self._visual(rgb, t_res)
 
-        if t_score > 80:
-            return {
-                "verdict": "NATURAL",
-                "confidence": 85,
-                "reason": "Textura natural com alta variabilidade",
-                "main_score": t_score,
-                "all_scores": all_scores,
-                "validation_chain": validation_chain,
-                "phases_executed": 1,
-                "visual_report": tex['visual_report'],
-                "heatmap": tex['heatmap'],
-                "percent_suspicious": tex['percent_suspicious'],
-                "detailed_reason": f"Score {t_score}/100 elevado."
-            }
+        all_scores = {"texture": t_score}
+        chain = ["texture"]
 
-        # 2) BORDAS
-        edg = self.edge_analyzer.analyze_image(image)
-        e_score = edg['edge_score']
-        all_scores['edge'] = e_score
-        validation_chain.append('edge')
+        # Só condena na Fase 1 se MUITO baixo e sem priors fortes de foto
+        if t_score < 34 and photo_prior_votes == 0:
+            return self._pack(
+                verdict="MANIPULADA",
+                confidence=90,
+                reason="Textura fortemente artificial e ausência de sinais típicos de foto",
+                main_score=t_score, all_scores=all_scores, chain=chain,
+                vis=vis_img, heat=heat, t_res=t_res
+            )
 
-        # -------- EXIT PRUDENTE na Fase 2 --------
-        # Só declara MANIPULADA se houver FORTE ACORDO:
-        # textura baixa + borda baixa + suspeita concentrada em regiões SEM borda.
-        overlap_low_edge = tex['analysis_results']['overlap_low_edge']
-        strong_agree = (t_score < 55) and (e_score < 32) and (overlap_low_edge >= 0.60)
+        # Se a textura já é confortável e há pelo menos 2 priors de foto -> NATURAL direto
+        if t_score >= 62 and photo_prior_votes >= 2:
+            return self._pack(
+                verdict="NATURAL",
+                confidence=85,
+                reason="Textura natural com múltiplos sinais de captura fotográfica",
+                main_score=t_score, all_scores=all_scores, chain=chain,
+                vis=vis_img, heat=heat, t_res=t_res
+            )
 
-        if strong_agree:
-            return {
-                "verdict": "MANIPULADA",
-                "confidence": 90,
-                "reason": "Textura e bordas artificiais em áreas planas",
-                "main_score": t_score,
-                "all_scores": all_scores,
-                "validation_chain": validation_chain,
-                "phases_executed": 2,
-                "visual_report": tex['visual_report'],
-                "heatmap": tex['heatmap'],
-                "percent_suspicious": tex['percent_suspicious'],
-                "detailed_reason": f"edge={e_score}, texture={t_score}, overlap_low_edge={overlap_low_edge:.2f}."
-            }
-        # -----------------------------------------
+        # ---------- FASE 2: Bordas ----------
+        e = self.edge.analyze(rgb)["edge_score"]
+        all_scores["edge"] = e
+        chain.append("edge")
+        if e < 35 and t_score < 50 and photo_prior_votes == 0:
+            return self._pack("MANIPULADA", 88,
+                              "Textura fraca e bordas artificiais",
+                              t_score, all_scores, chain, vis_img, heat, t_res)
 
-        # 3) RUÍDO
-        noi = self.noise_analyzer.analyze_image(image)
-        n_score = noi['noise_score']
-        all_scores['noise'] = n_score
-        validation_chain.append('noise')
+        # ---------- FASE 3: Ruído ----------
+        n = self.noise.analyze(rgb)["noise_score"]
+        all_scores["noise"] = n
+        chain.append("noise")
+        if n < 35 and t_score < 50 and photo_prior_votes == 0:
+            return self._pack("MANIPULADA", 85,
+                              "Textura fraca e ruído inconsistente",
+                              t_score, all_scores, chain, vis_img, heat, t_res)
 
-        if (n_score < 38) and (t_score < 55) and (overlap_low_edge >= 0.60):
-            return {
-                "verdict": "MANIPULADA",
-                "confidence": 85,
-                "reason": "Múltiplos indicadores artificiais (ruído inconsistente em áreas planas)",
-                "main_score": t_score,
-                "all_scores": all_scores,
-                "validation_chain": validation_chain,
-                "phases_executed": 3,
-                "visual_report": tex['visual_report'],
-                "heatmap": tex['heatmap'],
-                "percent_suspicious": tex['percent_suspicious'],
-                "detailed_reason": f"texture={t_score}, noise={n_score}, overlap_low_edge={overlap_low_edge:.2f}."
-            }
+        # ---------- FASE 4: Iluminação ----------
+        l = self.light.analyze(rgb)["lighting_score"]
+        all_scores["lighting"] = l
+        chain.append("lighting")
+        if l < 8 and t_score < 50 and photo_prior_votes == 0:
+            return self._pack("MANIPULADA", 80,
+                              "Física de iluminação inconsistente",
+                              t_score, all_scores, chain, vis_img, heat, t_res)
 
-        # 4) ILUMINAÇÃO
-        lig = self.lighting_analyzer.analyze_image(image)
-        l_score = lig['lighting_score']
-        all_scores['lighting'] = l_score
-        validation_chain.append('lighting')
+        # ---------- Absolvedor de maioria (quando textura é média) ----------
+        good = (1 if e >= 68 else 0) + (1 if n >= 68 else 0) + (1 if l >= 20 else 0) + (1 if photo_prior_votes >= 2 else 0)
+        if 45 <= t_score <= 62 and good >= 2:
+            return self._pack(
+                verdict="NATURAL",
+                confidence=80,
+                reason="Textura intermediária, mas bordas/ruído/iluminação e/ou priors fotográficos consistentes",
+                main_score=int(0.30*t_score + 0.30*e + 0.25*n + 0.15*l),
+                all_scores=all_scores, chain=chain, vis=vis_img, heat=heat, t_res=t_res
+            )
 
-        if l_score < 10:
-            return {
-                "verdict": "MANIPULADA",
-                "confidence": 80,
-                "reason": "Física de iluminação impossível",
-                "main_score": t_score,
-                "all_scores": all_scores,
-                "validation_chain": validation_chain,
-                "phases_executed": 4,
-                "visual_report": tex['visual_report'],
-                "heatmap": tex['heatmap'],
-                "percent_suspicious": tex['percent_suspicious'],
-                "detailed_reason": f"Iluminação {l_score}/30 inconsistente."
-            }
-
-        # ABSOLVEDOR — maioria positiva nas fases 2–4 OU suspeita alinhada a bordas
-        good = 0
-        good += 1 if e_score >= 68 else 0
-        good += 1 if n_score >= 68 else 0
-        good += 1 if l_score >= 18 else 0
-        if (50 <= t_score <= 80 and good >= 2) or (overlap_low_edge < 0.45):
-            main = int(t_score * 0.35 + e_score * 0.30 + n_score * 0.25 + l_score * 0.10)
-            return {
-                "verdict": "NATURAL",
-                "confidence": 80,
-                "reason": "Textura mediana e demais validadores consistentes / suspeita coincide com bordas",
-                "main_score": main,
-                "all_scores": all_scores,
-                "validation_chain": validation_chain,
-                "phases_executed": 4,
-                "visual_report": tex['visual_report'],
-                "heatmap": tex['heatmap'],
-                "percent_suspicious": tex['percent_suspicious'],
-                "detailed_reason": (
-                    f"Absolvido: edge={e_score}, noise={n_score}, lighting={l_score}, "
-                    f"texture={t_score}, overlap_low_edge={overlap_low_edge:.2f}."
-                )
-            }
-
-        # CASO FINAL — ponderado
-        weighted = t_score * 0.50 + e_score * 0.25 + n_score * 0.15 + l_score * 0.10
-        if weighted < 55:
-            verdict, confidence, reason = "SUSPEITA", 70, "Indicadores ambíguos"
+        # ---------- Score final ponderado ----------
+        weighted = 0.45 * t_score + 0.23 * e + 0.20 * n + 0.12 * l
+        if weighted >= 60 or photo_prior_votes >= 2:
+            verdict, conf, reason = "NATURAL", 75, "Conjunto de indícios favorece foto/autenticidade"
+        elif weighted < 50 and photo_prior_votes == 0:
+            verdict, conf, reason = "SUSPEITA", 70, "Indicadores mistos com sinais fracos de foto"
         else:
-            verdict, confidence, reason = "INCONCLUSIVA", 60, "Revisão manual necessária"
+            verdict, conf, reason = "INCONCLUSIVA", 60, "Revisão manual sugerida"
 
+        return self._pack(
+            verdict=verdict, confidence=conf, reason=reason,
+            main_score=int(weighted), all_scores=all_scores, chain=chain,
+            vis=vis_img, heat=heat, t_res=t_res
+        )
+
+    # -------- helpers de visual/empacote --------
+    @staticmethod
+    def _visual(img_rgb, t_res):
+        nat = t_res["naturalness_map"]
+        H, W = img_rgb.shape[:2]
+        nat = cv2.resize(nat, (W, H), interpolation=cv2.INTER_LINEAR)
+        disp = cv2.normalize(nat, None, 0, 1, cv2.NORM_MINMAX)
+        heat = cv2.applyColorMap((disp * 255).astype(np.uint8), cv2.COLORMAP_JET)
+        overlay = cv2.addWeighted(cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR), 0.6, heat, 0.4, 0)
+        # texto
+        out = overlay.copy()
+        score = t_res["naturalness_score"]
+        cat, _ = TextureAnalyzer.classify(score)
+        cv2.putText(out, f"Score: {score}/100", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2)
+        cv2.putText(out, cat, (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2)
+        return out, heat
+
+    @staticmethod
+    def _pack(verdict, confidence, reason, main_score, all_scores, chain, vis, heat, t_res):
         return {
             "verdict": verdict,
             "confidence": confidence,
             "reason": reason,
-            "main_score": int(weighted),
+            "main_score": int(main_score),
             "all_scores": all_scores,
-            "validation_chain": validation_chain,
-            "phases_executed": 4,
-            "visual_report": tex['visual_report'],
-            "heatmap": tex['heatmap'],
-            "percent_suspicious": tex['percent_suspicious'],
-            "detailed_reason": f"Score ponderado: {int(weighted)}/100."
+            "validation_chain": chain,
+            "phases_executed": len(chain),
+            "visual_report": vis,
+            "heatmap": heat,
+            "percent_suspicious": float(np.mean(t_res["suspicious_mask"]) * 100.0),
+            "detailed_reason": f"Texture score={t_res['naturalness_score']} | suspicious_ratio={t_res['suspicious_ratio']:.2f}",
         }
 
 
-# ================================
-# UTILITÁRIO
-# ================================
+# (mantive util para download, caso use)
 def get_image_download_link(img, filename, text):
     if isinstance(img, np.ndarray):
-        if img.ndim == 3 and img.shape[2] == 3:
+        if len(img.shape) == 3 and img.shape[2] == 3:
             img_pil = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
         else:
             img_pil = Image.fromarray(img)
     else:
         img_pil = img
-
     buf = io.BytesIO()
     img_pil.save(buf, format='JPEG', quality=95)
     buf.seek(0)
-
     img_str = base64.b64encode(buf.read()).decode()
     href = f'<a href="data:image/jpeg;base64,{img_str}" download="{filename}">{text}</a>'
     return href
