@@ -62,7 +62,7 @@ class TextureAnalyzer:
                 
                 max_entropy = np.log(10)
                 norm_entropy = block_entropy / max_entropy if max_entropy > 0 else 0
-                block_variance = np.var(block) / 255.0
+                block_variance = np.var(block / float(self.P + 2))
                 
                 max_hist_value = np.max(hist)
                 uniformity_penalty = 1.0 - max_hist_value
