@@ -10,7 +10,7 @@ import numpy as np
 from PIL import Image
 from scipy.stats import entropy
 from skimage.feature import local_binary_pattern
-from skimage.restoration import estimate_sigma
+from skimage.restoration import estimate_sigma  # (mantido caso queira comparar futuramente)
 
 
 # ----------------------------- utilidades base ----------------------------- #
@@ -178,8 +178,7 @@ class TextureAnalyzer:
         return "Textura natural", "Baixa chance de manipulação"
 
     def analyze_image(self, image):
-        gray = _to_gray_uint8(image)
-        res  = self.analyze_texture_variance(gray)
+        res  = self.analyze_texture_variance(image)
         score = res["naturalness_score"]
         cat, desc = self.classify(score)
 
@@ -187,7 +186,10 @@ class TextureAnalyzer:
         rgb = _to_rgb(image)
         h, w = rgb.shape[:2]
         mask = cv2.resize(res["suspicious_mask"].astype(np.uint8), (w, h), interpolation=cv2.INTER_NEAREST)
-        heat = cv2.applyColorMap(_safe_uint8(cv2.normalize(cv2.resize(res["naturalness_map"], (w, h), cv2.INTER_LINEAR), None, 0, 1, cv2.NORM_MINMAX) * 255), cv2.COLORMAP_JET)
+        heat = cv2.applyColorMap(
+            _safe_uint8(cv2.normalize(cv2.resize(res["naturalness_map"], (w, h), cv2.INTER_LINEAR), None, 0, 1, cv2.NORM_MINMAX) * 255),
+            cv2.COLORMAP_JET
+        )
         overlay = cv2.addWeighted(rgb, 0.6, heat, 0.4, 0)
         cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         cv2.drawContours(overlay, cnts, -1, (0, 0, 255), 2)
@@ -327,7 +329,6 @@ class EdgeAnalyzer:
         }
 
 
-
 class NoiseAnalyzer:
     """
     Análise de ruído SEM CLAHE.
@@ -337,7 +338,8 @@ class NoiseAnalyzer:
     - combina consistência espacial + presença de ruído plausível
     """
 
-    def __init__(self, block_size=32, detail_grad_thresh=6.0, hp_sigma=1.0):
+    def __init__(self, block_size=32, detail_grad_thresh=6.0, hp_sigma=1.0, use_clahe=False):
+        # use_clahe aceito apenas para compatibilidade; ignorado aqui
         self.block = int(block_size)
         self.grad_t = float(detail_grad_thresh)  # threshold do gradiente p/ máscara de detalhe
         self.hp_sigma = float(hp_sigma)          # sigma do blur p/ high-pass
@@ -380,14 +382,12 @@ class NoiseAnalyzer:
         cols = max(1, W // self.block)
         sigma = np.zeros((rows, cols), np.float32)
 
-        idx = 0
         for i in range(0, H - self.block + 1, self.block):
             for j in range(0, W - self.block + 1, self.block):
                 block = resid[i:i + self.block, j:j + self.block]
                 med = np.median(block)
                 mad = np.median(np.abs(block - med))
                 sigma[i // self.block, j // self.block] = 1.4826 * mad
-                idx += 1
         return sigma
 
     # ---- API principal ----
@@ -451,9 +451,9 @@ class NoiseAnalyzer:
             "clahe_enabled": False
         }
 
+
 class LightingAnalyzer:
     """Iluminação COM CLAHE – suavidade + gradiente global."""
-
     def __init__(self, use_clahe=True, clahe_clip_limit=2.0, clahe_tile_size=8):
         self.clahe = _CLAHE(use_clahe, clahe_clip_limit, clahe_tile_size)
 
@@ -504,7 +504,7 @@ class SequentialAnalyzer:
     def __init__(self):
         self.texture_analyzer  = TextureAnalyzer()
         self.edge_analyzer     = EdgeAnalyzer(use_clahe=True)
-        self.noise_analyzer    = NoiseAnalyzer(use_clahe=True)
+        self.noise_analyzer    = NoiseAnalyzer(block_size=32, detail_grad_thresh=6.0, hp_sigma=1.0)
         self.lighting_analyzer = LightingAnalyzer(use_clahe=True)
 
     def analyze_sequential(self, image):
