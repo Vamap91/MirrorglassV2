@@ -554,6 +554,30 @@ class SequentialAnalyzer:
                 "percent_suspicious": texture_result['percent_suspicious'],
                 "detailed_reason": f"Iluminação inconsistente ({lighting_score}/100)."
             }
+        good = 0
+        good += 1 if edge_score      >= 70 else 0   # bordas coerentes
+        good += 1 if noise_score     >= 70 else 0   # ruído consistente
+        good += 1 if lighting_score  >= 20 else 0   # iluminação aceitável
+
+        if 50 <= texture_score <= 80 and good >= 2:
+            return {
+                "verdict": "NATURAL",
+                "confidence": 80,  # ajuste entre 75–85 conforme seu apetite de risco
+                "reason": "Textura intermediária, mas bordas/ruído/iluminação consistentes",
+                "main_score": int(
+                    texture_score * 0.35 + edge_score * 0.30 + noise_score * 0.25 + lighting_score * 0.10
+                ),
+                "all_scores": all_scores,
+                "validation_chain": validation_chain,
+                "phases_executed": 4,
+                "visual_report": texture_result['visual_report'],
+                "heatmap": texture_result['heatmap'],
+                "percent_suspicious": texture_result['percent_suspicious'],
+                "detailed_reason": (
+                    f"Absolvido por maioria: edge={edge_score}, noise={noise_score}, "
+                    f"lighting={lighting_score}, texture={texture_score}."
+                )
+            }
         
         # ========================================
         # CASO FINAL: ANÁLISE INCONCLUSIVA
